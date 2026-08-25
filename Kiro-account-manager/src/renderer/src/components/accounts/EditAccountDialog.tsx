@@ -25,6 +25,10 @@ export function EditAccountDialog({
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [region, setRegion] = useState('us-east-1')
+  // API/额度区域（profile 解析 / 用量 / 聊天端点）；登录/刷新仍用 region。切换时清空旧 profileArn。
+  const [apiRegion, setApiRegion] = useState('us-east-1')
+  // 已解析的 Enterprise profileArn（随 apiRegion 变化；切换区域时清空以触发后端按新区域重解析）
+  const [profileArn, setProfileArn] = useState<string | undefined>(undefined)
 
   // 可编辑字段
   const [nickname, setNickname] = useState('')
@@ -71,6 +75,8 @@ export function EditAccountDialog({
       setClientId(account.credentials.clientId || '')
       setClientSecret(account.credentials.clientSecret || '')
       setRegion(account.credentials.region || 'us-east-1')
+      setApiRegion(account.credentials.apiRegion || account.credentials.region || 'us-east-1')
+      setProfileArn(account.credentials.profileArn)
       setNickname(account.nickname || '')
       
       // 设置当前账号信息
@@ -130,6 +136,7 @@ export function EditAccountDialog({
         clientId,
         clientSecret,
         region,
+        apiRegion,
         authMethod: account?.credentials.authMethod,
         provider: account?.credentials.provider || account?.idp
       })
@@ -145,6 +152,14 @@ export function EditAccountDialog({
           daysRemaining: result.data.daysRemaining,
           expiresAt: result.data.expiresAt
         })
+        // 记录按当前 apiRegion 解析出的真实 profileArn；
+        // 仅当解析结果与所选额度区域匹配、或当前尚无值时才覆盖，避免把手填的 ARN 冲掉。
+        if (result.data.profileArn) {
+          const arnMatchesRegion = result.data.profileArn.includes(`:${apiRegion}:`)
+          if (arnMatchesRegion || !profileArn) {
+            setProfileArn(result.data.profileArn)
+          }
+        }
         // 更新 refreshToken（可能返回新的）
         if (result.data.refreshToken) {
           setRefreshToken(result.data.refreshToken)
@@ -169,6 +184,9 @@ export function EditAccountDialog({
       email: accountInfo.email,
       userId: accountInfo.userId,
       nickname: nickname || undefined,
+      // 顶层 profileArn 与 credentials.profileArn 保持同步（自愈回写会写两处）；
+      // 切换 apiRegion 后 profileArn 已被清空，这里一并清顶层，避免旧区域 ARN 被复用。
+      profileArn,
       credentials: {
         ...account.credentials,
         accessToken: accountInfo.accessToken,
@@ -177,6 +195,8 @@ export function EditAccountDialog({
         clientId,
         clientSecret,
         region,
+        apiRegion,
+        profileArn,
         expiresAt: now + 3600 * 1000
       },
       subscription: {
@@ -369,16 +389,106 @@ export function EditAccountDialog({
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">AWS Region</label>
+                    <label className="text-sm font-medium">{isEn ? 'AWS Region (Login/OIDC)' : 'AWS 区域（登录/OIDC）'}</label>
                     <select
                       value={region}
                       onChange={(e) => setRegion(e.target.value)}
                       className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
                     >
-                      <option value="us-east-1">us-east-1 (N. Virginia)</option>
-                      <option value="us-west-2">us-west-2 (Oregon)</option>
-                      <option value="eu-west-1">eu-west-1 (Ireland)</option>
+                      <optgroup label="US">
+                        <option value="us-east-1">us-east-1 (N. Virginia)</option>
+                        <option value="us-east-2">us-east-2 (Ohio)</option>
+                        <option value="us-west-1">us-west-1 (N. California)</option>
+                        <option value="us-west-2">us-west-2 (Oregon)</option>
+                      </optgroup>
+                      <optgroup label="Europe">
+                        <option value="eu-west-1">eu-west-1 (Ireland)</option>
+                        <option value="eu-west-2">eu-west-2 (London)</option>
+                        <option value="eu-west-3">eu-west-3 (Paris)</option>
+                        <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
+                        <option value="eu-north-1">eu-north-1 (Stockholm)</option>
+                        <option value="eu-south-1">eu-south-1 (Milan)</option>
+                      </optgroup>
+                      <optgroup label="Asia Pacific">
+                        <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+                        <option value="ap-northeast-2">ap-northeast-2 (Seoul)</option>
+                        <option value="ap-northeast-3">ap-northeast-3 (Osaka)</option>
+                        <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+                        <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
+                        <option value="ap-south-1">ap-south-1 (Mumbai)</option>
+                        <option value="ap-east-1">ap-east-1 (Hong Kong)</option>
+                      </optgroup>
+                      <optgroup label="Other">
+                        <option value="ca-central-1">ca-central-1 (Canada)</option>
+                        <option value="sa-east-1">sa-east-1 (São Paulo)</option>
+                        <option value="me-south-1">me-south-1 (Bahrain)</option>
+                        <option value="af-south-1">af-south-1 (Cape Town)</option>
+                      </optgroup>
                     </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">{isEn ? 'API / Quota Region' : 'API/额度区域'}</label>
+                    <select
+                      value={apiRegion}
+                      onChange={(e) => {
+                        setApiRegion(e.target.value)
+                        // 切换额度区域后，旧 profileArn 属于原区域，清空以便按新区域重新解析
+                        setProfileArn(undefined)
+                      }}
+                      className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                    >
+                      <optgroup label="US">
+                        <option value="us-east-1">us-east-1 (N. Virginia)</option>
+                        <option value="us-east-2">us-east-2 (Ohio)</option>
+                        <option value="us-west-1">us-west-1 (N. California)</option>
+                        <option value="us-west-2">us-west-2 (Oregon)</option>
+                      </optgroup>
+                      <optgroup label="Europe">
+                        <option value="eu-west-1">eu-west-1 (Ireland)</option>
+                        <option value="eu-west-2">eu-west-2 (London)</option>
+                        <option value="eu-west-3">eu-west-3 (Paris)</option>
+                        <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
+                        <option value="eu-north-1">eu-north-1 (Stockholm)</option>
+                        <option value="eu-south-1">eu-south-1 (Milan)</option>
+                      </optgroup>
+                      <optgroup label="Asia Pacific">
+                        <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+                        <option value="ap-northeast-2">ap-northeast-2 (Seoul)</option>
+                        <option value="ap-northeast-3">ap-northeast-3 (Osaka)</option>
+                        <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+                        <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
+                        <option value="ap-south-1">ap-south-1 (Mumbai)</option>
+                        <option value="ap-east-1">ap-east-1 (Hong Kong)</option>
+                      </optgroup>
+                      <optgroup label="Other">
+                        <option value="ca-central-1">ca-central-1 (Canada)</option>
+                        <option value="sa-east-1">sa-east-1 (São Paulo)</option>
+                        <option value="me-south-1">me-south-1 (Bahrain)</option>
+                        <option value="af-south-1">af-south-1 (Cape Town)</option>
+                      </optgroup>
+                    </select>
+                    <p className="text-xs text-muted-foreground">
+                      {isEn
+                        ? 'Used for profile/usage/chat. Login region stays fixed to the IdC instance region. Switch here to use a different-region Kiro profile (e.g. eu-central-1).'
+                        : '用于 profile 解析 / 用量 / 聊天请求。登录区域保持 IdC 实例所在区域不变；想用另一区域的 Kiro profile（如 eu-central-1）时改这里。切换后建议点下方"验证并刷新"重新解析该区域的 profileArn。'}
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">{isEn ? 'Profile ARN (optional)' : 'Profile ARN（选填）'}</label>
+                    <input
+                      type="text"
+                      value={profileArn || ''}
+                      onChange={(e) => setProfileArn(e.target.value.trim() || undefined)}
+                      placeholder="arn:aws:codewhisperer:eu-central-1:...:profile/..."
+                      className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {isEn
+                        ? 'Leave empty to auto-resolve. If auto-resolve cannot find the profile for the selected API region, paste the region-matching profile ARN here.'
+                        : '留空则自动解析。若自动解析取不到所选额度区域的 profile（日志显示 matched=false），把该区域对应的 profile ARN 粘到这里即可。'}
+                    </p>
                   </div>
                 </>
               )}

@@ -386,6 +386,9 @@ export interface ProxyAccount {
   clientId?: string
   clientSecret?: string
   region?: string
+  /** API/额度区域：ListAvailableProfiles / GetUsageLimits / 聊天端点 / profileArn 使用此区域；
+   *  为空时回落到 region。用于「登录区域(IdC 实例, 如 us-east-1) 与 额度区域(如 eu-central-1) 解耦」的场景。 */
+  apiRegion?: string
   authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
   provider?: string
   profileArn?: string

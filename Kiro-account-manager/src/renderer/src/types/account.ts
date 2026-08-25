@@ -17,7 +17,8 @@ export interface AccountCredentials {
   refreshToken?: string
   clientId?: string      // OIDC 客户端 ID（用于刷新 token）
   clientSecret?: string  // OIDC 客户端密钥
-  region?: string        // AWS 区域，默认 us-east-1
+  region?: string        // AWS 区域，默认 us-east-1（登录/OIDC 区域）
+  apiRegion?: string     // API/额度区域：profile 解析 / 用量 / 聊天端点使用；为空回落 region
   startUrl?: string      // SSO Start URL（Enterprise 账户专用）
   expiresAt: number      // 时间戳
   authMethod?: 'IdC' | 'social'  // 认证方式：IdC (BuilderId/Enterprise) 或 social (GitHub/Google)

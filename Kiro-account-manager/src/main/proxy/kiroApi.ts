@@ -205,8 +205,7 @@ export function getAgentMode(): 'vibe' | 'spec' {
 import {
   KIRO_BUILDER_ID_PLACEHOLDER_ARN as _KIRO_BUILDER_ID_PLACEHOLDER_ARN,
   KIRO_SOCIAL_PROFILE_ARN,
-  isPlaceholderProfileArn as _isPlaceholderProfileArn,
-  getEnterpriseFallbackArn
+  isPlaceholderProfileArn as _isPlaceholderProfileArn
 } from '../kiroAuthSync'
 
 export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
@@ -214,23 +213,37 @@ export const isPlaceholderProfileArn = _isPlaceholderProfileArn
 
 /**
  * 反代调 Kiro API 时使用的 profileArn 决策。
- * 优先级：真实 ARN（自动获取） > 备用固定 ARN（按账号类型）
- * - 已有真实 ARN（非占位符） → 直接用
- * - Enterprise/IdC → 区域化备用 ARN（自动获取失败时兜底）
- * - Social（Github/Google） → 固定 social ARN
- * - BuilderId → 占位符 ARN
+ *
+ * 只在能给出「对当前身份有效」的 ARN 时才返回，否则返回 undefined（调用方不附加 profileArn）。
+ * 背景（见 issue #99 端到端实测）：给身份附加不属于它的 profileArn 会触发
+ * 403「User is not authorized to make this call.」。
+ * - 已解析出的真实 ARN（非占位符） → 直接用
+ * - Social（Github/Google） → Kiro 后端固定 social ARN（实测有效）
+ * - Enterprise/IdC → 只用组织自己的真实 ARN（由 fetchEnterpriseProfileArn 解析并写入
+ *   account.profileArn）；拿不到就返回 undefined，绝不回落到他人账号的兜底 ARN
+ * - BuilderId → 不附加 profileArn（BuilderId 无 profile 概念，附加占位符必 403）
  */
 function resolveProfileArn(account: ProxyAccount): string | undefined {
-  if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
+  // 已存 profileArn 必须属于当前 API/额度区域才可用；否则视为无效（跨区域旧 ARN / 污染数据），
+  // 交由调用方按正确区域重新解析，避免拿 us-east-1 的 ARN 去查 eu-central-1（400/403）。
+  if (
+    account.profileArn &&
+    !isPlaceholderProfileArn(account.profileArn) &&
+    storedProfileArnMatchesRegion(account)
+  ) {
     return account.profileArn
-  }
-  if (account.provider === 'Enterprise' || account.authMethod === 'external_idp') {
-    return getEnterpriseFallbackArn(account.region)
   }
   if (account.authMethod === 'social' || account.provider === 'Github' || account.provider === 'Google') {
     return KIRO_SOCIAL_PROFILE_ARN
   }
-  return KIRO_BUILDER_ID_PLACEHOLDER_ARN
+  // Enterprise 无有效同区域 ARN，或 BuilderId：一律不附加 profileArn
+  return undefined
+}
+
+/** 已存 profileArn 是否属于账号当前 API/额度区域（用于识别跨区域旧 ARN / 污染数据）。 */
+function storedProfileArnMatchesRegion(account: ProxyAccount): boolean {
+  if (!account.profileArn) return false
+  return account.profileArn.includes(`:codewhisperer:${regionHost(getApiRegion(account))}:`)
 }
 
 // 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
@@ -368,7 +381,7 @@ function isCodeWhispererModelId(modelId: string): boolean {
 }
 
 function getModelCacheKey(account: ProxyAccount): string {
-  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account) ?? 'no-arn'}`
+  return `${account.id}:${getApiRegion(account)}:${resolveProfileArn(account) ?? 'no-arn'}`
 }
 
 async function getCachedCodeWhispererModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
@@ -1202,24 +1215,34 @@ function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[
 }
 
 // 获取排序后的端点列表（根据首选端点配置）
-function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'): typeof KIRO_ENDPOINTS {
-  if (!preferredEndpoint) return KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
-  
-  // AmazonQ CLI 模式：只用这一个端点，失败不回退
+function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli', apiRegion?: string): typeof KIRO_ENDPOINTS {
+  const host = regionHost(apiRegion)
+  const isRemote = host !== 'us-east-1'
+  // 只把 Amazon Q(q.*) 端点区域化；CodeWhisperer runtime 仅存在于 us-east-1，保持不变。
+  const regionalize = (eps: typeof KIRO_ENDPOINTS): typeof KIRO_ENDPOINTS =>
+    isRemote
+      ? eps.map(ep => ep.url.includes('://codewhisperer.') ? ep : { ...ep, url: ep.url.replace('us-east-1', host) })
+      : eps
+  // 非 us-east-1 额度区域：CodeWhisperer 无该区域端点（直连 TLS 重置），剔除，只走 q.{region}。
+  const dropRemoteCw = (eps: typeof KIRO_ENDPOINTS): typeof KIRO_ENDPOINTS =>
+    isRemote ? eps.filter(ep => !ep.url.includes('://codewhisperer.')) : eps
+
   if (preferredEndpoint === 'amazonq-cli') {
-    return KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQCLI')
+    return regionalize(KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQCLI'))
   }
-  
-  const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
-  
-  const sorted = KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
-  sorted.sort((a, b) => {
-    if (a.name === preferredName) return -1
-    if (b.name === preferredName) return 1
-    return 0
-  })
-  
-  return sorted
+
+  let list = dropRemoteCw(KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI'))
+
+  if (preferredEndpoint) {
+    const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
+    list = [...list].sort((a, b) => {
+      if (a.name === preferredName) return -1
+      if (b.name === preferredName) return 1
+      return 0
+    })
+  }
+
+  return regionalize(list)
 }
 
 function getAbortError(signal?: AbortSignal): Error {
@@ -1245,10 +1268,10 @@ export async function callKiroApiStream(
 ): Promise<void> {
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
   // 所有账号类型均走正常端点优先级（含 fallback），不再强制 Enterprise 走 CodeWhisperer
-  const endpoints = getSortedEndpoints(preferredEndpoint)
+  const endpoints = getSortedEndpoints(preferredEndpoint, getApiRegion(account))
 
   // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底，流式端点自动不传占位符）
-  if (!account.profileArn && isEnterprise) {
+  if (isEnterprise && !storedProfileArnMatchesRegion(account)) {
     const fetchedArn = await fetchEnterpriseProfileArn(account)
     if (fetchedArn) {
       account.profileArn = fetchedArn
@@ -1262,8 +1285,9 @@ export async function callKiroApiStream(
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
-      // profileArn 决策：后端所有端点均强制要求 profileArn（400 "profileArn is required"）
-      // resolveProfileArn 按账号类型返回：BuilderId→占位符 / Social→固定 / Enterprise→真实ARN
+      // profileArn 决策：仅在解析出「对当前身份有效」的 ARN 时才附加。
+      // resolveProfileArn：Social→固定 social ARN / Enterprise→组织真实 ARN /
+      // BuilderId 或 Enterprise 未解析到真实 ARN→undefined（不附加，避免 403，见 issue #99）
       const resolvedArn = resolveProfileArn(account)
       if (resolvedArn) {
         requestPayload.profileArn = resolvedArn
@@ -2237,27 +2261,33 @@ export interface KiroModel {
 }
 
 // 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
+// 将任意 AWS 区域归一到 Kiro 后端实际支持的端点 host：eu-* → eu-central-1，其余 → us-east-1
+function regionHost(region?: string): string {
+  return region?.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+}
+
+// API/额度区域：优先 account.apiRegion，回落 account.region，最后 us-east-1。
+// 登录/刷新(OIDC) 仍用 account.region；此函数仅用于 profile 解析 / 用量 / 聊天等 API 调用。
+export function getApiRegion(account: ProxyAccount): string {
+  return account.apiRegion || account.region || 'us-east-1'
+}
+
 function getQServiceEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
-  return 'https://q.us-east-1.amazonaws.com'
+  return `https://q.${regionHost(region)}.amazonaws.com`
+}
+
+function getCodeWhispererEndpoint(region?: string): string {
+  return `https://codewhisperer.${regionHost(region)}.amazonaws.com`
 }
 
 // 根据账号区域获取 CodeWhisperer Runtime 端点
-function getCodeWhispererEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://codewhisperer.eu-central-1.amazonaws.com'
-  return 'https://codewhisperer.us-east-1.amazonaws.com'
-}
 
-/**
- * Enterprise 账号获取 profileArn（通过 CodeWhisperer Runtime 的 /ListAvailableProfiles）
- * 官方 IDE 在认证后通过此 API 获取可用 profiles，用户选择后存储 ARN。
- * 反代自动取第一个 profile。
- */
-export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
-  const baseUrl = getCodeWhispererEndpoint(account.region)
-  const url = `${baseUrl}/ListAvailableProfiles`
-  const machineId = getAccountMachineId(account.id, account.machineId)
-
+/** 向指定 base 发一次 ListAvailableProfiles，返回 profiles 数组（失败返回空数组）。 */
+async function listAvailableProfiles(
+  baseUrl: string,
+  account: ProxyAccount,
+  machineId: string | undefined
+): Promise<Array<{ arn?: string; profileName?: string }>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${account.accessToken}`,
@@ -2266,49 +2296,67 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
-
-  // 获取该账号类型对应的备用 ARN（403 时兜底，避免每次请求都重复尝试）
-  const fallbackArn = resolveProfileArn(account)
-
   try {
-    const response = await fetchWithProxy(url, {
+    const response = await fetchWithProxy(`${baseUrl}/ListAvailableProfiles`, {
       method: 'POST',
       headers,
       body: JSON.stringify({})
     }, account)
-
     if (!response.ok) {
       const errBody = await response.text().catch(() => '')
-      console.error(`[KiroAPI] ListAvailableProfiles failed: ${response.status}`, errBody.slice(0, 200))
-      // 403 = 无权限（BuilderId/Social 账号不支持此 API）→ 返回备用 ARN 作为缓存，不再重复尝试
-      if (response.status === 403 && fallbackArn) {
-        console.log(`[KiroAPI] Using fallback profileArn for ${account.provider || 'unknown'}: ${fallbackArn}`)
-        return fallbackArn
-      }
-      return undefined
+      console.error(`[KiroAPI] ListAvailableProfiles(${baseUrl}) failed: ${response.status}`, errBody.slice(0, 200))
+      return []
     }
-
     const data = await response.json() as { profiles?: Array<{ arn?: string; profileName?: string }> }
-    const profiles = data.profiles || []
-    if (profiles.length === 0) {
-      console.warn('[KiroAPI] ListAvailableProfiles: no profiles returned')
-      return undefined
-    }
-
-    const arn = profiles[0].arn
-    if (arn) {
-      console.log(`[KiroAPI] Enterprise profileArn resolved: ${arn}`)
-    }
-    return arn || undefined
+    return data.profiles || []
   } catch (error) {
-    console.error('[KiroAPI] fetchEnterpriseProfileArn error:', error)
-    return undefined
+    console.error(`[KiroAPI] ListAvailableProfiles(${baseUrl}) error:`, error instanceof Error ? error.message : error)
+    return []
   }
+}
+
+/**
+ * Enterprise 账号获取 profileArn。
+ *
+ * 端点事实：CodeWhisperer runtime 仅存在于 us-east-1；Amazon Q(q.*) 才是多区域。
+ * 且 CodeWhisperer(us-east-1) 的 ListAvailableProfiles 只返回 us-east-1 的 profile，
+ * 不含其它区域。因此：
+ *   1. 先用 codewhisperer.us-east-1 发现（拿到 us-east-1 profile）；
+ *   2. 若目标额度区域(apiRegion) 非 us-east-1 且未命中，则改用 q.{apiRegion} 发现该区域 profile；
+ *   3. 优先返回与 apiRegion 匹配的 ARN，否则回落第一个。
+ */
+export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
+  const machineId = getAccountMachineId(account.id, account.machineId)
+  const wantHost = regionHost(getApiRegion(account))
+
+  // 1) CodeWhisperer runtime（us-east-1）
+  let profiles = await listAvailableProfiles(getCodeWhispererEndpoint('us-east-1'), account, machineId)
+  let matched = profiles.find(p => typeof p.arn === 'string' && p.arn.includes(`:codewhisperer:${wantHost}:`))
+  let via = 'codewhisperer.us-east-1'
+
+  // 2) 远区未命中 → 用 Amazon Q 区域端点 q.{apiRegion} 发现该区域 profile
+  if (!matched && wantHost !== 'us-east-1') {
+    const remote = await listAvailableProfiles(getQServiceEndpoint(wantHost), account, machineId)
+    if (remote.length > 0) {
+      const remoteMatch = remote.find(p => typeof p.arn === 'string' && p.arn.includes(`:codewhisperer:${wantHost}:`))
+      profiles = remote
+      matched = remoteMatch || remote[0]
+      via = `q.${wantHost}`
+    }
+  }
+
+  const arn = matched?.arn || profiles[0]?.arn
+  if (arn) {
+    console.log(`[KiroAPI] Enterprise profileArn resolved (want=${wantHost}, via=${via}, matched=${!!matched}, total=${profiles.length}): ${arn}`)
+  } else {
+    console.warn(`[KiroAPI] Enterprise profileArn 未解析到（want=${wantHost}）：ListAvailableProfiles 无返回或该区域不支持发现，请在编辑账号里手动填写 profileArn。`)
+  }
+  return arn || undefined
 }
 
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(getApiRegion(account))
   const machineId = getAccountMachineId(account.id, account.machineId)
   
   const headers: Record<string, string> = {
@@ -2325,7 +2373,7 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
 
   // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底）
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
-  if (!account.profileArn && isEnterprise) {
+  if (isEnterprise && !storedProfileArnMatchesRegion(account)) {
     const fetchedArn = await fetchEnterpriseProfileArn(account)
     if (fetchedArn) {
       account.profileArn = fetchedArn
@@ -2338,9 +2386,9 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
       const arnForModels = resolveProfileArn(account)
       // profileArn 决策由 resolveProfileArn 统一处理：
-      //   - BuilderId → 占位符 ARN（ListAvailableModels 需要，有效）
-      //   - Github/Google → social ARN（有效）
-      //   - Enterprise → 真实 ARN（上方已自愈获取）
+      //   - Github/Google → 固定 social ARN
+      //   - Enterprise → 组织真实 ARN（上方已自愈获取；拿不到则不附加）
+      //   - BuilderId → 不附加（附加占位符会 403，见 issue #99）
       if (arnForModels) params.set('profileArn', arnForModels)
       if (nextToken) params.set('nextToken', nextToken)
 
@@ -2405,7 +2453,7 @@ function getSubscriptionAmzUserAgent(machineId?: string): string {
 
 // 获取可用订阅列表
 export async function fetchAvailableSubscriptions(account: ProxyAccount): Promise<SubscriptionListResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(getApiRegion(account))
   const url = `${baseUrl}/listAvailableSubscriptions`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -2455,7 +2503,7 @@ export async function fetchSubscriptionToken(
   account: ProxyAccount,
   subscriptionType?: string
 ): Promise<SubscriptionTokenResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(getApiRegion(account))
   const url = `${baseUrl}/CreateSubscriptionToken`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -2504,7 +2552,7 @@ export async function setUserPreference(
   account: ProxyAccount,
   overageStatus: 'ENABLED' | 'DISABLED'
 ): Promise<{ success: boolean; error?: string }> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(getApiRegion(account))
   const url = `${baseUrl}/setUserPreference`
   const machineId = getAccountMachineId(account.id, account.machineId)
 

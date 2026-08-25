@@ -5,14 +5,6 @@
 </p>
 
 <p align="center">
-  <strong>QQ 交流群: 653516618</strong>
-</p>
-
-<p align="center">
-  <img src="Kiro-account-manager/src/renderer/src/assets/交流群.png" width="200" alt="QQ 交流群">
-</p>
-
-<p align="center">
   <strong>一个功能强大的 Kiro IDE 多账号管理工具</strong>
 </p>
 
@@ -271,6 +263,42 @@ npx electron-builder --linux --arm64
 
 ## 📋 更新日志
 
+
+### v1.7.7 (2026-8-25) — 双区域解耦（登录/额度区域分离）+ profileArn 区域路由与自愈 + token 过期自动刷新
+
+#### 🌍 登录区域 / API 额度区域解耦
+
+- **新增**: 账号新增 `apiRegion`（API/额度区域）字段，与 `region`（登录/OIDC 区域）分离。登录/刷新走 IdC 实例所在区域（如 us-east-1），profile 解析 / 用量 / 聊天请求走 apiRegion（如 eu-central-1）
+- **新增**: 编辑账号对话框新增「API/额度区域」下拉（原区域标注为「AWS 区域（登录/OIDC）」）+「Profile ARN（选填）」手动输入框；切换额度区域时自动清空旧 profileArn 触发重解析
+- **场景**: 同一企业身份（us-east-1 登录）可切换使用另一区域（如 eu-central-1）的 KiroProfile 额度
+
+#### 🔧 profileArn 区域路由修复（端点事实校正）
+
+- **修复**: CodeWhisperer runtime 实测仅存在于 us-east-1（`codewhisperer.eu-central-1` 不存在，直连 TLS 重置）；`ListAvailableProfiles` 固定走 `codewhisperer.us-east-1` 发现；远区（如 eu-central-1）改用 Amazon Q 端点 `q.{region}/ListAvailableProfiles` 发现该区域 profile，并按区域挑选匹配 ARN
+- **修复**: 聊天/用量端点按 apiRegion 路由 —— `q.*` 区域化到额度区域；`codewhisperer.*` 保持 us-east-1；额度区非 us-east-1 时剔除 codewhisperer 端点，仅走 `q.{region}`（AmazonQ）
+
+#### 🛡️ 移除他人兜底 ARN + 跨区域自愈（修复 403/400）
+
+- **修复**: 移除硬编码的他人账号兜底 ARN（`610548660232:profile/VNECVYCYYAWN`）—— 附加不属于当前身份的 profileArn 会触发 403「User is not authorized to make this call」（参见 issue #99）
+- **修复**: BuilderId 不再附加占位符 profileArn（附加占位符会 403，不带反而 200）
+- **新增**: 跨区域自愈 —— 任何链路发现已存 profileArn 与目标区域不匹配（旧 ARN/污染数据）时自动丢弃并按目标区域重新解析，消除 400「Improperly formed request」
+- **新增**: profileArn 持久化区域保护 —— 仅回写与账号 apiRegion 匹配的 ARN，防止反代/后台用错区域 ARN 覆盖污染
+
+#### 🔄 反代账号池 apiRegion 同步
+
+- **修复**: 渲染进程推送反代池的账号对象补齐 apiRegion；账号保存时主进程直接同步池内 apiRegion（与当前所在页面无关），切换额度区域后反代即时改用新区域计费
+- **新增**: 反代同步签名纳入 apiRegion，切换区域自动触发重同步
+
+#### 🔑 token 过期自动刷新
+
+- **修复**: token 过期时 CodeWhisperer/Q 返回 403（"Token expired" / "bearer token invalid"）而非 401，此前刷新仅在 401 触发导致卡死；现扩展判定，403 过期类错误也自动刷新并重试（`check-account-status` 与后台 `syncInfo` 两条路径均覆盖）
+
+#### 🧹 其他
+
+- **移除**: 关于页移除赞助（支付宝/微信）区块
+- **移除**: README 移除 QQ 交流群信息
+
+---
 
 ### v1.7.5 (2026-6-7) — 思考模式支持 + Enterprise profileArn 完整修复 + Agent 模式与 Steering + 工具调用泄漏修复
 

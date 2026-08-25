@@ -1,9 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
-import { Github, Heart, Code, ExternalLink, User, Coffee, MessageCircle, X, RefreshCw, Download, CheckCircle, AlertCircle, Info, Zap } from 'lucide-react'
+import { Github, Heart, Code, ExternalLink, User, MessageCircle, X, RefreshCw, Download, CheckCircle, AlertCircle, Info, Zap } from 'lucide-react'
 import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
-import alipayQR from '@/assets/支付宝支付.png'
-import wechatQR from '@/assets/微信支付.png'
 import groupQR from '@/assets/交流群.png'
 import authorAvatar from '@/assets/author-avatar.png'
 import { useAccountsStore } from '@/store/accounts'
@@ -388,37 +386,6 @@ export function AboutPage() {
               GitHub
               <ExternalLink className="h-3 w-3" />
             </a>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Sponsor */}
-      <Card className="hover-lift">
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-primary/10">
-              <Coffee className="h-4 w-4 text-primary" />
-            </div>
-            {isEn ? 'Sponsor' : '赞助支持'}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm text-muted-foreground mb-4">
-            {isEn ? 'If this project helps you, buy me a coffee ☕' : '如果这个项目对你有帮助，可以请作者喝杯咖啡 ☕'}
-          </p>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="text-center space-y-2">
-              <div className="bg-[#1677FF]/5 rounded-xl p-3 border border-[#1677FF]/20">
-                <img src={alipayQR} alt="Alipay" className="w-full aspect-square object-contain rounded-lg" />
-              </div>
-              <p className="text-sm font-medium text-[#1677FF]">{isEn ? 'Alipay' : '支付宝'}</p>
-            </div>
-            <div className="text-center space-y-2">
-              <div className="bg-[#07C160]/5 rounded-xl p-3 border border-[#07C160]/20">
-                <img src={wechatQR} alt="WeChat Pay" className="w-full aspect-square object-contain rounded-lg" />
-              </div>
-              <p className="text-sm font-medium text-[#07C160]">{isEn ? 'WeChat Pay' : '微信支付'}</p>
-            </div>
           </div>
         </CardContent>
       </Card>

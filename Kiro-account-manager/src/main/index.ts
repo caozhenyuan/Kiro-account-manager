@@ -484,6 +484,7 @@ function initProxyServer(): ProxyServer {
             clientId: acc.credentials?.clientId,
             clientSecret: acc.credentials?.clientSecret,
             region: acc.credentials?.region || 'us-east-1',
+            apiRegion: acc.credentials?.apiRegion,
             authMethod: acc.credentials?.authMethod,
             provider: acc.credentials?.provider || acc.idp,
             proxyUrl: buildProxyUrl(acc.id)
@@ -508,6 +509,17 @@ function initProxyServer(): ProxyServer {
   // 回写到账号池 + 内存快照 + 通知 renderer 落盘，避免每次请求重复获取。
   setProfileArnPersistCallback((accountId, profileArn) => {
     try {
+      // 防跨区域污染：若账号已指定 API/额度区域，则只回写与该区域匹配的 profileArn。
+      // 避免某条链路用错区域解析出的 ARN 覆盖掉正确区域的 ARN（导致后续查询 400）。
+      const poolAcc = proxyServer?.getAccountPool().getAccount(accountId)
+      const wantRegion = poolAcc?.apiRegion || poolAcc?.region
+      if (wantRegion && profileArn) {
+        const wantHost = wantRegion.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+        if (!profileArn.includes(`:${wantHost}:`)) {
+          console.warn(`[ProxyServer] Skip persisting profileArn (region mismatch, want ${wantHost}): ${profileArn}`)
+          return
+        }
+      }
       proxyServer?.getAccountPool().updateAccount(accountId, { profileArn })
       // 推送 IPC，让 renderer store 把 profileArn 写入账号数据
       mainWindow?.webContents.send('proxy-account-update', { id: accountId, profileArn })
@@ -1264,6 +1276,34 @@ async function getUsageAndLimits(
   ssoRegion?: string,         // SSO 区域，用于选择正确的 REST API 端点
   email?: string              // 用于日志标识
 ): Promise<UnifiedUsageResponse> {
+  // Enterprise/IdC：GetUsageLimits 按 profile 维度鉴权，缺 profileArn 会返回
+  // 403「User is not authorized to make this call.」。若调用方未提供，或传入的 profileArn
+  // 与目标区域不匹配（跨区域旧 ARN / 污染数据，会 400「Improperly formed request」），
+  // 则按目标区域自动重新解析（BuilderId/Social 不需要、也不应携带，见 issue #99）。
+  if (idp === 'Enterprise') {
+    const wantHost = (ssoRegion || 'us-east-1').startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+    if (profileArn && !profileArn.includes(`:codewhisperer:${wantHost}:`)) {
+      console.warn(`[Usage] 忽略与区域(${wantHost})不匹配的 profileArn，将重新解析: ${profileArn}`)
+      profileArn = undefined
+    }
+    if (!profileArn) {
+      try {
+        profileArn = (await fetchEnterpriseProfileArn({
+          id: '',
+          accessToken,
+          region: ssoRegion || 'us-east-1',
+          apiRegion: ssoRegion,
+          provider: 'Enterprise',
+          authMethod: 'IdC'
+        })) || undefined
+        if (profileArn) {
+          console.log(`[Usage] Enterprise profileArn resolved for query: ${profileArn}`)
+        }
+      } catch (e) {
+        console.warn('[Usage] resolve Enterprise profileArn failed:', e)
+      }
+    }
+  }
   if (currentUsageApiType === 'rest') {
     // 使用 REST API (GetUsageLimits)
     const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
@@ -1884,6 +1924,7 @@ type BackgroundRefreshAccount = {
     clientId?: string
     clientSecret?: string
     region?: string
+    apiRegion?: string
     authMethod?: string
     accessToken?: string
     provider?: string
@@ -1910,6 +1951,23 @@ function isBannedAccountErrorMain(error?: string): boolean {
     || /\b423\b/.test(e)
 }
 
+/**
+ * 判定是否为「token 过期 / 无效」类错误，需要刷新 token 后重试。
+ * CodeWhisperer/Q 对过期 token 返回的是 403（非 401），文案如：
+ * "Token expired" / "The bearer token included in the request is invalid." /
+ * "The security token included in the request is expired"。
+ */
+function isExpiredTokenErrorMain(error?: string): boolean {
+  if (!error) return false
+  const e = error.toLowerCase()
+  return e.includes('401')
+    || e.includes('token expired')
+    || e.includes('bearer token included in the request is invalid')
+    || e.includes('invalid bearer token')
+    || e.includes('security token included in the request is expired')
+    || e.includes('expired token')
+}
+
 /** 刷新提前量：≥ 2× 检查间隔且不少于 10 分钟，确保 token 不会在两次 tick 之间过期。 */
 function mainTokenRefreshLeadMs(intervalMin: number): number {
   return Math.max(intervalMin * 2 * 60 * 1000, 10 * 60 * 1000)
@@ -1934,6 +1992,7 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
           clientId?: string
           clientSecret?: string
           region?: string
+          apiRegion?: string
           authMethod?: string
           accessToken?: string
           provider?: string
@@ -1972,6 +2031,7 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
           clientId: creds.clientId,
           clientSecret: creds.clientSecret,
           region: creds.region,
+          apiRegion: creds.apiRegion,
           authMethod: creds.authMethod,
           accessToken: creds.accessToken,
           provider: creds.provider,
@@ -2961,6 +3021,28 @@ app.whenReady().then(async () => {
       
       // 保存最后的数据（用于崩溃恢复）
       lastSavedData = data
+
+      // 账号保存时，把 apiRegion 变化同步到运行中的反代账号池（与当前停留在哪个页面无关）。
+      // 这样在账号页/编辑框切换额度区域时，反代会立即改用新区域；旧 profileArn 一并清空，
+      // 下次请求由跨区域自愈按新区域重新解析，避免反代仍用旧区域计费。
+      try {
+        const pool = proxyServer?.getAccountPool()
+        const accts = (data as { accounts?: Record<string, { id?: string; credentials?: { apiRegion?: string } }> } | null)?.accounts
+        if (pool && accts) {
+          for (const acc of Object.values(accts)) {
+            if (!acc?.id) continue
+            const poolAcc = pool.getAccount(acc.id)
+            if (!poolAcc) continue
+            const newApiRegion = acc.credentials?.apiRegion
+            if ((poolAcc.apiRegion || undefined) !== (newApiRegion || undefined)) {
+              pool.updateAccount(acc.id, { apiRegion: newApiRegion, profileArn: undefined })
+              console.log(`[ProxyServer] Pool apiRegion synced for ${acc.id}: ${poolAcc.apiRegion || '(none)'} → ${newApiRegion || '(none)'}`)
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[ProxyServer] Failed to sync apiRegion to pool:', e)
+      }
       
       // 每次保存时也创建备份
       await createBackup(data)
@@ -3506,6 +3588,8 @@ app.whenReady().then(async () => {
 
     try {
       const { accessToken, refreshToken, clientId, clientSecret, region, authMethod, provider } = account.credentials || {}
+      // API/额度区域（用量查询用）；登录/刷新(OIDC) 仍用 region。缺省回落 region。
+      const apiRegion = account.credentials?.apiRegion || region
 
       // 查询账号绑定的代理（账号池）
       const boundProxyUrl = proxyServer
@@ -3540,7 +3624,7 @@ app.whenReady().then(async () => {
             }
             return undefined
           }),
-          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region, account?.email)
+          getUsageAndLimits(accessToken, idp, account?.credentials?.profileArn, accountMachineId, apiRegion, account?.email)
         ])
         return parseUsageResponse(usageResult, undefined, userInfoResult)
       } catch (apiError) {
@@ -3555,10 +3639,10 @@ app.whenReady().then(async () => {
           }
         }
         
-        // 检查是否是 401 错误（token 过期）
+        // 检查是否是 token 过期/无效错误（401 或 403「Token expired / bearer token invalid」）
         // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
         const canRefresh = refreshToken && (authMethod === 'social' || (clientId && clientSecret))
-        if (errorMsg.includes('401') && canRefresh) {
+        if (isExpiredTokenErrorMain(errorMsg) && canRefresh) {
           console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
 
           // 尝试刷新 token - 根据 authMethod 选择刷新方式（透传账号代理）
@@ -3582,7 +3666,7 @@ app.whenReady().then(async () => {
                 }
                 return undefined
               }),
-              getUsageAndLimits(refreshResult.accessToken, idp, undefined, accountMachineId, region)
+              getUsageAndLimits(refreshResult.accessToken, idp, account?.credentials?.profileArn, accountMachineId, apiRegion)
             ])
             
             // 返回结果并包含新凭证
@@ -3831,7 +3915,29 @@ app.whenReady().then(async () => {
                   }
                 }
                 console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, undefined, account.machineId, region) as UsageResponse
+                let rawUsage: UsageResponse
+                try {
+                  rawUsage = await getUsageAndLimits(newAccessToken, idp, account.credentials?.profileArn, account.machineId, account.credentials?.apiRegion || region) as UsageResponse
+                } catch (usageErr) {
+                  const uMsg = usageErr instanceof Error ? usageErr.message : String(usageErr)
+                  // 本轮未刷新 token（needsTokenRefresh=false）却遇到 token 过期/无效 → 兜底刷新一次再重试，
+                  // 并更新 newAccessToken/newRefreshToken/newExpiresIn 以便下方回传持久化。
+                  const canRefreshHere = !needsTokenRefresh && refreshToken && (authMethod === 'social' || (clientId && clientSecret))
+                  if (isExpiredTokenErrorMain(uMsg) && canRefreshHere) {
+                    console.log(`[BackgroundRefresh] Usage token expired for ${account.id}, refreshing & retrying...`)
+                    const rr = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region || 'us-east-1', authMethod, boundProxyUrl)
+                    if (rr.success && rr.accessToken) {
+                      newAccessToken = rr.accessToken
+                      newRefreshToken = rr.refreshToken || newRefreshToken
+                      newExpiresIn = rr.expiresIn
+                      rawUsage = await getUsageAndLimits(newAccessToken, idp, account.credentials?.profileArn, account.machineId, account.credentials?.apiRegion || region) as UsageResponse
+                    } else {
+                      throw usageErr
+                    }
+                  } else {
+                    throw usageErr
+                  }
+                }
                 
                 // 解析使用量数据
                 const creditUsage = rawUsage.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
@@ -4004,6 +4110,8 @@ app.whenReady().then(async () => {
       clientId?: string
       clientSecret?: string
       region?: string
+      apiRegion?: string
+      profileArn?: string
       authMethod?: string
       provider?: string
     }
@@ -4043,7 +4151,7 @@ app.whenReady().then(async () => {
 
             // 调用 API 获取用量和用户信息（根据配置选择 REST 或 CBOR 格式）
             const [usageRes, userInfoRes] = await Promise.allSettled([
-              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region, account.email) as Promise<{
+              getUsageAndLimits(accessToken, idp, account.credentials?.profileArn, undefined, account.credentials?.apiRegion || account.credentials?.region, account.email) as Promise<{
                 usageBreakdownList?: Array<{
                   resourceType?: string
                   displayName?: string
@@ -4374,6 +4482,7 @@ app.whenReady().then(async () => {
     clientId: string
     clientSecret: string
     region?: string
+    apiRegion?: string
     authMethod?: string
     provider?: string  // 'BuilderId', 'Github', 'Google' 等
   }) => {
@@ -4381,6 +4490,8 @@ app.whenReady().then(async () => {
     
     try {
       const { refreshToken, clientId, clientSecret, region = 'us-east-1', authMethod, provider } = credentials
+      // API/额度区域：用于 profile 解析 + 用量查询；登录/刷新(OIDC) 仍用 region。缺省回落 region。
+      const apiRegion = credentials.apiRegion || region
       // 确定 idp：社交登录使用 provider，IdC 也需要根据 provider 区分 BuilderId 和 Enterprise
       const idp = provider && (provider === 'Enterprise' || provider === 'Github' || provider === 'Google') 
         ? provider 
@@ -4455,7 +4566,31 @@ app.whenReady().then(async () => {
         userInfo?: { email?: string; userId?: string }
       }
       
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region) as UsageResponse
+      // Enterprise/IdC：GetUsageLimits 按 profile 维度鉴权，必须先解析出组织真实 profileArn
+      // 再查询；否则不带 profileArn 会返回 403「User is not authorized to make this call.」。
+      // （BuilderId/Social 反而不应携带 profileArn，见 issue #99）
+      let enterpriseProfileArn: string | undefined
+      const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
+      if (isEnt) {
+        try {
+          enterpriseProfileArn = await fetchEnterpriseProfileArn({
+            id: '',
+            accessToken: refreshResult.accessToken!,
+            region: apiRegion,
+            provider,
+            authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined
+          })
+          if (enterpriseProfileArn) {
+            console.log(`[Verify] Enterprise profileArn auto-resolved: ${enterpriseProfileArn}`)
+          } else {
+            console.warn('[Verify] Enterprise profileArn 未解析到（ListAvailableProfiles 可能返回 403 / 无 profile / API 区域不匹配）')
+          }
+        } catch (e) {
+          console.warn('[Verify] Failed to fetch Enterprise profileArn:', e)
+        }
+      }
+
+      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, enterpriseProfileArn, undefined, apiRegion) as UsageResponse
       
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
@@ -4525,26 +4660,6 @@ app.whenReady().then(async () => {
       
       console.log('[Verify] Success! Email:', email)
 
-      // Enterprise 账号：验证时自动获取 profileArn（BuilderId/Social 不需要调 API）
-      let enterpriseProfileArn: string | undefined
-      const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
-      if (isEnt) {
-        try {
-          enterpriseProfileArn = await fetchEnterpriseProfileArn({
-            id: '',
-            accessToken: refreshResult.accessToken!,
-            region: region || 'us-east-1',
-            provider,
-            authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined
-          })
-          if (enterpriseProfileArn) {
-            console.log(`[Verify] Enterprise profileArn auto-resolved: ${enterpriseProfileArn}`)
-          }
-        } catch (e) {
-          console.warn('[Verify] Failed to fetch Enterprise profileArn:', e)
-        }
-      }
-      
       return {
         success: true,
         data: {

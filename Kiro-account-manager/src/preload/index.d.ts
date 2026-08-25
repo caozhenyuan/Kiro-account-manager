@@ -158,6 +158,7 @@ interface KiroApi {
       clientId?: string
       clientSecret?: string
       region?: string
+      apiRegion?: string
       authMethod?: string
       accessToken?: string
       provider?: string
@@ -176,6 +177,7 @@ interface KiroApi {
       clientId?: string
       clientSecret?: string
       region?: string
+      apiRegion?: string
       authMethod?: string
       provider?: string
     }
@@ -259,6 +261,7 @@ interface KiroApi {
     clientId: string
     clientSecret: string
     region?: string
+    apiRegion?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
   }) => Promise<{
@@ -269,6 +272,7 @@ interface KiroApi {
       accessToken: string
       refreshToken: string
       expiresIn?: number
+      profileArn?: string
       subscriptionType: string
       subscriptionTitle: string
       subscription?: {
@@ -642,7 +646,7 @@ interface KiroApi {
   proxyRemoveAccount: (accountId: string) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
   // 同步账号到反代池（批量更新）
-  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>) => Promise<{ success: boolean; accountCount?: number; error?: string }>
+  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; apiRegion?: string; authMethod?: string; provider?: string; machineId?: string }>) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
   // 获取反代池账号列表
   proxyGetAccounts: () => Promise<{ accounts: unknown[]; availableCount: number }>

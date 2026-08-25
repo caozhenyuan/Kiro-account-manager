@@ -1404,6 +1404,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         clientId?: string
         clientSecret?: string
         region?: string
+        apiRegion?: string
         authMethod?: string
         accessToken?: string
         provider?: string
@@ -1424,6 +1425,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           clientId: account.credentials.clientId,
           clientSecret: account.credentials.clientSecret,
           region: account.credentials.region,
+          apiRegion: account.credentials.apiRegion,
           authMethod: account.credentials.authMethod,
           accessToken: account.credentials.accessToken,
           provider: account.credentials.provider || account.idp,
@@ -1562,6 +1564,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         clientId?: string
         clientSecret?: string
         region?: string
+        apiRegion?: string
         authMethod?: string
         provider?: string
       }
@@ -1581,6 +1584,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           clientId: account.credentials.clientId,
           clientSecret: account.credentials.clientSecret,
           region: account.credentials.region,
+          apiRegion: account.credentials.apiRegion,
           authMethod: account.credentials.authMethod,
           provider: account.credentials.provider
         },
@@ -2392,6 +2396,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         clientId?: string
         clientSecret?: string
         region?: string
+        apiRegion?: string
         authMethod?: string
         accessToken?: string
         provider?: string
@@ -2423,6 +2428,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             clientId: account.credentials.clientId,
             clientSecret: account.credentials.clientSecret,
             region: account.credentials.region,
+            apiRegion: account.credentials.apiRegion,
             authMethod: account.credentials.authMethod,
             accessToken: account.credentials.accessToken,
             provider: account.credentials.provider,

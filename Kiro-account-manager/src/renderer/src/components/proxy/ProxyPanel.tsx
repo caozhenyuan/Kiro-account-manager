@@ -293,6 +293,7 @@ export function ProxyPanel() {
           clientId: acc.credentials?.clientId,
           clientSecret: acc.credentials?.clientSecret,
           region: acc.credentials?.region || 'us-east-1',
+          apiRegion: acc.credentials?.apiRegion,
           authMethod: acc.credentials?.authMethod,
           provider: acc.credentials?.provider || acc.idp,
           // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
@@ -446,14 +447,14 @@ export function ProxyPanel() {
   useEffect(() => { syncAccountsRef.current = syncAccounts }, [syncAccounts])
 
   /**
-   * 账号集合签名：只反映"参与同步的账号 id + 分组"，**不含** token / 用量 / 状态时间戳。
+   * 账号集合签名：反映"参与同步的账号 id + 分组 + API/额度区域"，**不含** token / 用量 / 状态时间戳。
    * 这样后台 token 刷新、用量更新等高频变动不会触发重新同步（避免按钮疯狂闪烁），
-   * 仅在真正增删账号 / 改分组时才同步。token 更新由主进程账号池自身刷新逻辑处理。
+   * 仅在真正增删账号 / 改分组 / 切换额度区域时才同步。token 更新由主进程账号池自身刷新逻辑处理。
    */
   const accountsSyncSignature = useMemo(() => {
     return Array.from(accounts.values())
       .filter(a => a.status === 'active' && a.credentials?.accessToken)
-      .map(a => `${a.id}:${a.groupId || ''}`)
+      .map(a => `${a.id}:${a.groupId || ''}:${a.credentials?.apiRegion || ''}`)
       .sort()
       .join('|')
   }, [accounts])

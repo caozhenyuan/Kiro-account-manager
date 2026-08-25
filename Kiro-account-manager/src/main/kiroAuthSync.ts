@@ -49,10 +49,14 @@ export function getEnterpriseFallbackArn(region?: string): string {
 
 const PLACEHOLDER_PROFILE_ARNS = new Set<string>([KIRO_BUILDER_ID_PLACEHOLDER_ARN])
 
-/** 检查给定 ARN 是不是已知占位符（旧版反代 / Kiro IDE 自身可能写入的脏数据） */
+/** 检查给定 ARN 是不是已知占位符 / 无效兜底（旧版反代 / Kiro IDE 自身可能写入的脏数据） */
 export function isPlaceholderProfileArn(arn: string | undefined | null): boolean {
   if (!arn) return false
-  return PLACEHOLDER_PROFILE_ARNS.has(arn)
+  if (PLACEHOLDER_PROFILE_ARNS.has(arn)) return true
+  // 历史遗留的「他人账号」兜底 ARN：附加到任何身份都会触发 403，视同无效占位符，
+  // 避免旧版本已持久化的该值被当成真实 ARN 继续使用。
+  if (arn.includes(`:${ENTERPRISE_FALLBACK_ACCOUNT_ID}:profile/${ENTERPRISE_FALLBACK_PROFILE_ID}`)) return true
+  return false
 }
 
 /**

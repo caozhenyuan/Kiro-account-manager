@@ -5,14 +5,6 @@
 </p>
 
 <p align="center">
-  <strong>QQ Group: 653516618</strong>
-</p>
-
-<p align="center">
-  <img src="Kiro-account-manager/src/renderer/src/assets/交流群.png" width="200" alt="QQ Group">
-</p>
-
-<p align="center">
   <strong>A powerful multi-account management tool for Kiro IDE</strong>
 </p>
 
@@ -271,6 +263,42 @@ The project is configured with GitHub Actions workflow for auto building all pla
 
 ## 📋 Changelog
 
+
+### v1.7.7 (2026-8-25) — Region Decoupling (Login vs Quota) + profileArn Region Routing & Self-Heal + Auto Token Refresh on Expiry
+
+#### 🌍 Login Region / API (Quota) Region Decoupling
+
+- **New**: Accounts gain an `apiRegion` (API/quota region) field, separate from `region` (login/OIDC region). Login/refresh use the IdC instance region (e.g. us-east-1); profile resolution / usage / chat requests use `apiRegion` (e.g. eu-central-1)
+- **New**: Edit Account dialog adds an "API/Quota Region" dropdown (the original region is now labeled "AWS Region (Login/OIDC)") plus an optional "Profile ARN" input; switching quota region clears the stale profileArn to trigger re-resolution
+- **Use case**: A single enterprise identity (logged in via us-east-1) can switch to use a KiroProfile quota in another region (e.g. eu-central-1)
+
+#### 🔧 profileArn Region Routing Fix (endpoint reality)
+
+- **Fix**: CodeWhisperer runtime only exists in us-east-1 (`codewhisperer.eu-central-1` does not exist — TLS reset). `ListAvailableProfiles` now always uses `codewhisperer.us-east-1` for discovery; for remote regions (e.g. eu-central-1) it falls back to the Amazon Q endpoint `q.{region}/ListAvailableProfiles` and selects the ARN matching that region
+- **Fix**: Chat/usage endpoints route by `apiRegion` — `q.*` endpoints are regionalized to the quota region; `codewhisperer.*` stays on us-east-1; when the quota region isn't us-east-1 the CodeWhisperer endpoint is dropped and only `q.{region}` (AmazonQ) is used
+
+#### 🛡️ Removed Foreign Fallback ARN + Cross-Region Self-Heal (fixes 403/400)
+
+- **Fix**: Removed the hardcoded foreign fallback ARN (`610548660232:profile/VNECVYCYYAWN`) — attaching a profileArn that doesn't belong to the identity triggers 403 "User is not authorized to make this call" (see issue #99)
+- **Fix**: BuilderId no longer attaches a placeholder profileArn (placeholder → 403; without it → 200)
+- **New**: Cross-region self-heal — any path that finds a stored profileArn not matching the target region (stale/contaminated data) drops it and re-resolves for the target region, eliminating 400 "Improperly formed request"
+- **New**: profileArn persistence region guard — only writes back an ARN matching the account's `apiRegion`, preventing a wrong-region ARN from a proxy/background path from overwriting the correct one
+
+#### 🔄 Proxy Account Pool apiRegion Sync
+
+- **Fix**: Renderer proxy-pool payloads now include `apiRegion`; on account save the main process syncs the pool's `apiRegion` directly (independent of which page is open), so switching quota region takes effect on the running proxy immediately
+- **New**: The proxy sync signature now includes `apiRegion`, auto-triggering a resync on region switch
+
+#### 🔑 Auto Token Refresh on Expiry
+
+- **Fix**: On token expiry CodeWhisperer/Q returns 403 ("Token expired" / "bearer token invalid"), not 401; refresh was previously only triggered on 401 and got stuck. Now 403 expiry errors also trigger an automatic token refresh + retry (covered on both `check-account-status` and background `syncInfo` paths)
+
+#### 🧹 Misc
+
+- **Removed**: Sponsor (Alipay/WeChat) section from the About page
+- **Removed**: QQ group info from README
+
+---
 
 ### v1.7.5 (2026-6-7) — Thinking Mode + Enterprise profileArn Full Fix + Agent Mode & Steering + Tool Use Leak Fix
 

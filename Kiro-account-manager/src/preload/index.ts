@@ -56,6 +56,7 @@ const api = {
       clientId?: string
       clientSecret?: string
       region?: string
+      apiRegion?: string
       authMethod?: string
       accessToken?: string
       provider?: string
@@ -96,6 +97,7 @@ const api = {
       clientId?: string
       clientSecret?: string
       region?: string
+      apiRegion?: string
       authMethod?: string
       provider?: string
     }
@@ -200,6 +202,7 @@ const api = {
     clientId: string
     clientSecret: string
     region?: string
+    apiRegion?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
   }): Promise<{
@@ -210,6 +213,7 @@ const api = {
       accessToken: string
       refreshToken: string
       expiresIn?: number
+      profileArn?: string
       subscriptionType: string
       subscriptionTitle: string
       usage: { current: number; limit: number }
@@ -709,7 +713,7 @@ const api = {
   },
 
   // 同步账号到反代池（批量更新）
-  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
+  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; apiRegion?: string; authMethod?: string; provider?: string; machineId?: string }>): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-sync-accounts', accounts)
   },
 
