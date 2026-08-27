@@ -46,14 +46,12 @@ mac:
   # url 会把空格替换成 "-"（生成 "Kiro-Account-Manager-1.7.2-mac.zip"），导致
   # electron-updater 下载时 404。统一用 ${name} 后所有平台 / yml 命名一致。
   artifactName: ${name}-${version}-${arch}-mac.${ext}
-  # 显式构 x64 + arm64 两个架构的 zip 和 dmg，让 latest-mac.yml 同时包含两个 zip 入口
-  # 否则 Apple Silicon 用户即便修了文件名 mismatch，updater 也只会看到 x64.zip 入口，
-  # 强行下载并以 Rosetta 模式运行
+  # 仅构建 arm64（Apple Silicon）。zip 供 electron-updater 增量更新，dmg 供手动下载安装
   target:
     - target: zip
-      arch: [x64, arm64]
+      arch: [arm64]
     - target: dmg
-      arch: [x64, arm64]
+      arch: [arm64]
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
     - NSCameraUsageDescription: Application requests access to the device's camera.

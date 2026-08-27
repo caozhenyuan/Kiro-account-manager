@@ -2,7 +2,7 @@ import { Home, Users, Settings, Info, ChevronRight, Fingerprint, Sparkles, Serve
 import { motion, AnimatePresence } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
-import kiroLogoSmall from '@/assets/Kiro Logo.svg'
+import kiroLogoSmall from '@/assets/app-icon.png'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 
@@ -57,7 +57,7 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.8 }}
               transition={{ duration: 0.2 }}
-              className={cn('h-10 w-10 object-contain', darkMode && 'invert brightness-0')}
+              className="h-9 w-9 object-contain rounded-xl"
             />
           ) : (
             <motion.div
