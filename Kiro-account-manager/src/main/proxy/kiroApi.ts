@@ -1562,6 +1562,22 @@ async function parseEventStream(
     }
     return { name, input }
   }
+  // 解析泄漏的 <tool_use id="..." name="...">BODY</tool_use> 块。
+  // BODY 是本项目 formatToolUses 序列化的 JSON（stringifyToolInput）。模型模仿历史格式泄漏时同样产出 JSON。
+  // 解析失败（body 非合法 JSON）返回 null，交由调用方按普通文本原样输出，避免误吞。
+  const parseToolUseBlock = (name: string, body: string): { name: string; input: Record<string, unknown> } | null => {
+    const t = body.trim()
+    if (!t) return { name, input: {} }
+    try {
+      const parsed = JSON.parse(t)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { name, input: parsed as Record<string, unknown> }
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
   const stripToolPrefix = (pre: string): string => {
     const fc = pre.match(/<function_calls>\s*$/)
     if (fc) return pre.slice(0, pre.length - fc[0].length)
@@ -1574,8 +1590,14 @@ async function parseEventStream(
     if (i === -1) return false
     return !s.slice(i).includes('</invoke>')
   }
+  // 是否存在未闭合的 <tool_use ...> 起始标签（跨帧分片时用于判断是否要继续缓冲等待闭合）
+  const hasOpenToolUse = (s: string): boolean => {
+    const i = s.lastIndexOf('<tool_use')
+    if (i === -1) return false
+    return !s.slice(i).includes('</tool_use>')
+  }
   const pendingToolTail = (s: string): number => {
-    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', 'count']
+    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', 'count', '<tool_use', '</tool_use>']
     let hold = 0
     for (const tag of markers) {
       for (let k = Math.min(s.length, tag.length - 1); k >= 1; k--) {
@@ -1599,6 +1621,38 @@ async function parseEventStream(
       await onChunk(s)
       totalOutputChars += s.length
       collectedOutputText += s
+    }
+    // 提取所有已闭合的 <tool_use id="..." name="...">JSON</tool_use>
+    // 本项目 formatToolUses 用此格式把历史工具调用写进上下文，模型有时模仿它直接泄漏到 content。
+    // 先于 <invoke> 处理：避免 <invoke> 循环把尚未处理的 <tool_use> 块当普通文本 emit 出去。
+    const toolUseRe = /<tool_use\b[^>]*\bname="([^"]+)"[^>]*>([\s\S]*?)<\/tool_use>/g
+    for (;;) {
+      const oi = leakCarry.indexOf('<tool_use')
+      if (oi === -1) break
+      const oc = leakCarry.indexOf('</tool_use>', oi)
+      if (oc === -1) break // 未闭合，等更多帧
+      await emit(leakCarry.slice(0, oi))
+      toolUseRe.lastIndex = oi
+      const m = toolUseRe.exec(leakCarry)
+      const blockEnd = oc + '</tool_use>'.length
+      if (m && m.index === oi) {
+        const tool = parseToolUseBlock(m[1], m[2])
+        if (tool) {
+          leakedTools.push(tool)
+          if (toolLeakDebug) {
+            try {
+              console.log('[tool-leak-fix] parsed leaked <tool_use>:', tool.name, JSON.stringify(tool.input).slice(0, 120))
+            } catch { /* ignore */ }
+          }
+        } else {
+          // body 非合法 JSON：不是可救回的工具调用，原样当文本输出，避免误吞内容
+          await emit(leakCarry.slice(oi, blockEnd))
+        }
+      } else {
+        // 无 name 属性等异常形态：原样输出
+        await emit(leakCarry.slice(oi, blockEnd))
+      }
+      leakCarry = leakCarry.slice(blockEnd)
     }
     // 提取所有已闭合的 invoke
     for (;;) {
@@ -1628,14 +1682,18 @@ async function parseEventStream(
       if (fcClose) consumedEnd += fcClose[0].length
       leakCarry = leakCarry.slice(consumedEnd)
     }
-    if (hasOpenInvoke(leakCarry)) {
+    if (hasOpenInvoke(leakCarry) || hasOpenToolUse(leakCarry)) {
       if (isFlush) {
         // 流结束仍未闭合 = 损坏的工具调用，原样当文本输出（不丢字符）
         await emit(leakCarry)
         leakCarry = ''
         return
       }
-      const oi = leakCarry.indexOf('<invoke name=')
+      // 取未闭合的 <invoke / <tool_use 中更靠前的作为切分点，之前的正常文本安全输出
+      const iInvoke = leakCarry.indexOf('<invoke name=')
+      const iToolUse = leakCarry.indexOf('<tool_use')
+      const candidates = [iInvoke, iToolUse].filter(i => i !== -1)
+      const oi = Math.min(...candidates)
       const safe = stripToolPrefix(leakCarry.slice(0, oi))
       await emit(safe)
       leakCarry = leakCarry.slice(safe.length)
