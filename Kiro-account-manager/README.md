@@ -139,15 +139,7 @@ npm run typecheck
 
 ## 📋 Changelog
 
-### v1.7.8 (Current)
-
-#### 🐛 Fixes
-- **Tool-call `<tool_use>` XML leak / stuck conversation** — The v1.7.5 leak fix only covered the `<function_calls>/<invoke>/<parameter>` syntax and missed the `<tool_use id name>JSON</tool_use>` format that this project itself uses to serialize tool-call history. When the model mimicked that format and emitted it as plain text, the tags leaked as visible text and the client couldn't parse the tool call, so the agent stalled mid-task and required a manual "continue". The cross-frame filter now also handles the `<tool_use>` syntax: parsing it into a structured tool_use, deduping against already-seen tools at stream end, injecting the rescued call, and setting `stop_reason` to `tool_use` — working in streaming mode as well.
-
-#### 🎨 Improvements
-- **macOS app icon refinement (#115)** — Rebuilt to the macOS Big Sur icon spec: transparent-background white squircle (corner radius ~22.37% of content edge), content centered with ~10% transparent margin, fixing the icon looking oversized, square-cornered, and out of place next to native apps in the Dock. Regenerated the full icns (16→512@2x) / png / ico set.
-
-### v1.7.0
+### v1.7.0 (Current)
 
 #### 🔥 Major Features (4 phases, 19 new features)
 

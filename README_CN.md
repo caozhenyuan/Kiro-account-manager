@@ -264,6 +264,28 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.7.8 (2026-8-27) — 工具调用 `<tool_use>` 泄漏卡死修复 + macOS 图标规范化 + 侧边栏 logo 暗色修复
+
+#### 🐛 工具调用 `<tool_use>` XML 泄漏 / 对话卡住修复
+
+- **修复**: v1.7.5 的泄漏修复只覆盖 `<function_calls>/<invoke>/<parameter>` 语法，未处理本项目历史序列化所用的 `<tool_use id name>JSON</tool_use>` 格式。模型模仿该格式直接吐到正文时，标签泄漏成可见文本、且客户端解析不到工具调用，导致 Agent 中途卡住需手动发「继续」
+- **方案**: 在跨帧过滤器中并列支持 `<tool_use>` 语法 —— 解析为结构化 tool_use、流结束时与已见工具去重后注入救回，`stop_reason` 正确置为 `tool_use`，流式模式下同样生效。补齐 `hasOpenToolUse` / `pendingToolTail` 对跨帧分片标签的识别，修复未闭合标签切分点误切末字符的边界 bug
+
+#### 🎨 macOS App 图标规范化（#115）
+
+- **优化**: 按 macOS Big Sur 图标规范重制 —— 透明背景白色圆角矩形（squircle，圆角半径约内容边长 22.37%）、内容区居中并留四周约 10% 透明边距，解决图标在 Dock 中过大、缺圆角、与原生应用不协调的问题
+- **优化**: 重新生成 icns（16→512@2x 全尺寸）/ png / ico 全套，同步 `build/` 与 `resources/`
+
+#### 🖥️ 侧边栏折叠态 logo 暗色显示修复
+
+- **修复**: 折叠态小 logo 原为深蓝彩色，暗色模式下被 `invert brightness-0` 强刷成纯白方块丢失品牌色。改用方形透明 app-icon（白色 squircle + 彩色 Kiro）并去掉暗色滤镜，深色侧边栏中清晰且保留品牌色
+
+#### 📦 构建
+
+- **优化**: electron-builder mac 构建目标从 `[x64, arm64]` 收窄为仅 `arm64`，不再产出无用的 x64 dmg/zip
+
+---
+
 ### v1.7.7 (2026-8-25) — 双区域解耦（登录/额度区域分离）+ profileArn 区域路由与自愈 + token 过期自动刷新
 
 #### 🌍 登录区域 / API 额度区域解耦

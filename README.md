@@ -264,6 +264,28 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.8 (2026-8-27) — Tool-Call `<tool_use>` Leak / Stuck-Conversation Fix + macOS Icon Refinement + Sidebar Logo Dark-Mode Fix
+
+#### 🐛 Tool-Call `<tool_use>` XML Leak / Stuck Conversation Fix
+
+- **Fix**: The v1.7.5 leak fix only covered the `<function_calls>/<invoke>/<parameter>` syntax and missed the `<tool_use id name>JSON</tool_use>` format that this project itself uses to serialize tool-call history. When the model mimicked that format and emitted it as plain text, the tags leaked as visible text and the client couldn't parse the tool call, so the agent stalled mid-task and required a manual "continue"
+- **Approach**: The cross-frame filter now also handles the `<tool_use>` syntax — parsing it into a structured tool_use, deduping against already-seen tools at stream end, injecting the rescued call, and setting `stop_reason` to `tool_use` (works in streaming mode too). Added `hasOpenToolUse` / `pendingToolTail` recognition for tag fragments split across frames, and fixed an off-by-one slice bug on unterminated tags
+
+#### 🎨 macOS App Icon Refinement (#115)
+
+- **Improve**: Rebuilt to the macOS Big Sur icon spec — transparent-background white squircle (corner radius ~22.37% of content edge), content centered with ~10% transparent margin, fixing the icon looking oversized, square-cornered, and out of place next to native apps in the Dock
+- **Improve**: Regenerated the full icns (16→512@2x) / png / ico set, synced to both `build/` and `resources/`
+
+#### 🖥️ Sidebar Collapsed Logo Dark-Mode Fix
+
+- **Fix**: The collapsed-state logo was a dark-blue color mark that got force-flattened to a solid white square by `invert brightness-0` in dark mode, losing its brand color. Switched to a square transparent app-icon (white squircle + colored Kiro) and removed the dark-mode filter — clear on the dark sidebar while keeping the brand color
+
+#### 📦 Build
+
+- **Improve**: Narrowed the electron-builder mac target from `[x64, arm64]` to `arm64` only, no longer producing unused x64 dmg/zip
+
+---
+
 ### v1.7.7 (2026-8-25) — Region Decoupling (Login vs Quota) + profileArn Region Routing & Self-Heal + Auto Token Refresh on Expiry
 
 #### 🌍 Login Region / API (Quota) Region Decoupling
