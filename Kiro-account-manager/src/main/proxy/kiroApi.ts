@@ -1534,6 +1534,9 @@ async function parseEventStream(
   // 开关：环境变量 KIRO_TOOL_LEAK_FIX=off 可回退到原逐帧 <tool_use> 过滤。
   const toolLeakFixEnabled = (process.env.KIRO_TOOL_LEAK_FIX || 'on').toLowerCase().trim() !== 'off'
   const toolLeakDebug = process.env.KIRO_TOOL_LEAK_DEBUG === '1'
+  // KIRO_STREAM_DUMP=1 时逐帧打印原始 event（type + content 片段），用于排查「每段前缀重复某单词」
+  // 之类的输出错位：可确认是模型原始输出即如此，还是代理重复 emit 所致
+  const streamDump = process.env.KIRO_STREAM_DUMP === '1'
   let leakCarry = ''
   const leakedTools: Array<{ name: string; input: Record<string, unknown> }> = []
   const seenToolSigs = new Set<string>()
@@ -1761,7 +1764,20 @@ async function parseEventStream(
           try {
             const payloadText = new TextDecoder().decode(payloadBytes)
             const event = JSON.parse(payloadText)
-            
+
+            if (streamDump) {
+              try {
+                const ar = event.assistantResponseEvent || (eventType === 'assistantResponseEvent' ? event : undefined)
+                const ce = event.codeEvent || (eventType === 'codeEvent' ? event : undefined)
+                const textPart = (ar?.content ?? ce?.content) as string | undefined
+                if (textPart !== undefined) {
+                  console.log(`[stream-dump] ${eventType} content=${JSON.stringify(textPart).slice(0, 160)}`)
+                } else {
+                  console.log(`[stream-dump] ${eventType} ${JSON.stringify(event).slice(0, 160)}`)
+                }
+              } catch { /* ignore */ }
+            }
+
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
               const assistantResp = event.assistantResponseEvent || event
@@ -1786,7 +1802,8 @@ async function parseEventStream(
             // AmazonQ CLI 协议特有：CodeEvent (代码片段流式输出)
             // 来自 amzn_qdeveloper_streaming_client 的 ChatResponseStream::CodeEvent { content: String }
             // CodeWhisperer/AmazonQ 端点用 AssistantResponseEvent 包代码，CLI 端点单独用 CodeEvent
-            if (eventType === 'codeEvent' || event.codeEvent) {
+            // else if 与 assistantResponseEvent 互斥：避免同一帧同时携带两字段时正文 content 被 emit 两次（重复文本/前缀）
+            else if (eventType === 'codeEvent' || event.codeEvent) {
               const codeResp = event.codeEvent || event
               const content = codeResp.content as string | undefined
               if (content) {

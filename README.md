@@ -264,6 +264,18 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.9 (2026-8-28) — Streaming Duplicate-Text/Prefix Hardening + Raw-Stream Diagnostics
+
+#### 🐛 Streaming Event Double-Emit Hardening
+
+- **Fix**: The `codeEvent` branch was changed from a standalone `if` to an `else if` mutually exclusive with `assistantResponseEvent`. Previously, if a single frame carried both fields (or the check misfired), the body `content` was emitted twice, which could cause duplicated text / a repeated per-line prefix (like the repeated word observed at the start of each line). With the branches now exclusive, the body is processed only once
+
+#### 🔍 Diagnostics
+
+- **Add**: Env var `KIRO_STREAM_DUMP=1` prints each raw event's type + content fragment frame-by-frame, to determine whether output misalignment originates from the model's raw output or from duplicate emits in the proxy. Off by default, no runtime impact
+
+---
+
 ### v1.7.8 (2026-8-27) — Tool-Call `<tool_use>` Leak / Stuck-Conversation Fix + macOS Icon Refinement + Sidebar Logo Dark-Mode Fix
 
 #### 🐛 Tool-Call `<tool_use>` XML Leak / Stuck Conversation Fix
