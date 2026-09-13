@@ -264,6 +264,22 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.7.10 (2026-9-13) — 反代瞬时故障透明重试（fetch failed / 500 高负载）
+
+#### 🐛 上游「fetch failed」零重试直抛客户端修复
+
+- **背景**: 上游网络层错误（undici `fetch failed` / 连接重置 / DNS 等）此前不匹配任何重试分支（错误消息不含状态码与关键词），非流式请求直接把 `HTTP 500 fetch failed` 抛给客户端；流式请求同样无重试
+- **修复**: 新增网络层瞬时错误分类器，非流式 `callWithRetry` 对此类错误同账号退避重试，持续失败自动切换账号（与 5xx 分支同策略）
+
+#### 🐛 上游 500 高负载（MODEL_TEMPORARILY_UNAVAILABLE）流式零重试修复
+
+- **背景**: 流式请求完全绕过 `callWithRetry`（SSE 头 + `message_start` 在调用上游前就已写给客户端），上游 500 / `MODEL_TEMPORARILY_UNAVAILABLE` 只能以 `event: error` 收场，客户端报 `reason=unknown retryable=false`
+- **修复**: SSE 头与 `message_start` 延迟到上游产出首个事件再写（首块前延迟）。首块前失败时按错误类别透明重试（封禁→切号、Auth→刷新 Token、配额→切号、过载/网络→同号退避再切号），对客户端完全不可见；重试耗尽后以**真实 HTTP 状态码**返回 Anthropic 格式 JSON 错误（而非 200 + SSE error），客户端可正确识别错误类别。`/v1/chat/completions` 与 `/v1/messages` 两条流式路径同享该机制
+- **归属修正**: 流式透明重试换号成功后，成功统计（tokens/credits/请求记录）归属到真正服务的账号
+- **验证**: 新增 `test/smoke-retry.mts` 冒烟测试（伪造 AWS 上游）：fetch failed + 500 高负载流式透明重试成功、持续 500 返回真实 HTTP 500、非流式 fetch failed 重试成功
+
+---
+
 ### v1.7.9 (2026-8-28) — 流式输出重复文本/前缀加固 + 原始流诊断日志
 
 #### 🐛 流式事件双重 emit 加固

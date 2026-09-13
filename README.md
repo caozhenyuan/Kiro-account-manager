@@ -264,6 +264,22 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.10 (2026-9-13) — Transparent Retry for Transient Upstream Failures (fetch failed / 500 High Load)
+
+#### 🐛 Upstream "fetch failed" Was Passed Through With Zero Retries
+
+- **Background**: Network-level upstream errors (undici `fetch failed` / connection reset / DNS, etc.) matched no retry branch (the message carries no status code or keyword), so non-streaming requests returned `HTTP 500 fetch failed` straight to the client; streaming requests had no retry either
+- **Fix**: Added a transient-network-error classifier. Non-streaming `callWithRetry` now retries such errors on the same account with backoff and switches accounts after persistent failures (same strategy as the 5xx branch)
+
+#### 🐛 Upstream 500 High Load (MODEL_TEMPORARILY_UNAVAILABLE) Had Zero Streaming Retry
+
+- **Background**: Streaming requests bypassed `callWithRetry` entirely (the SSE headers + `message_start` were written to the client before the upstream call), so upstream 500 / `MODEL_TEMPORARILY_UNAVAILABLE` could only end with an `event: error`, leaving clients reporting `reason=unknown retryable=false`
+- **Fix**: SSE headers and `message_start` are now deferred until the first upstream event (pre-first-chunk deferral). Pre-first-chunk failures are retried transparently by error class (suspension → switch account; auth → refresh token; quota → switch account; overload/network → same-account backoff then switch), fully invisible to the client. When retries are exhausted the proxy returns a **real HTTP status code** with an Anthropic-format JSON error (instead of 200 + SSE error), so clients can classify the error properly. Both streaming paths (`/v1/chat/completions` and `/v1/messages`) share the mechanism
+- **Attribution fix**: after a transparent account switch succeeds, success stats (tokens/credits/request records) are attributed to the account that actually served the request
+- **Verification**: new `test/smoke-retry.mts` smoke test (fake AWS upstream): fetch failed + 500 high load recovers transparently on streaming, persistent 500 returns a real HTTP 500, non-streaming fetch failed retries successfully
+
+---
+
 ### v1.7.9 (2026-8-28) — Streaming Duplicate-Text/Prefix Hardening + Raw-Stream Diagnostics
 
 #### 🐛 Streaming Event Double-Emit Hardening

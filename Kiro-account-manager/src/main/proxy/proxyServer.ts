@@ -1345,6 +1345,134 @@ export class ProxyServer {
     }
   }
 
+  // 网络层瞬时错误（undici fetch failed / TCP 重置 / DNS / 代理断连）
+  // 与账号、请求内容均无关：同账号退避重试，持续失败再切号（问题清单 #1-#7「fetch failed」）
+  private isTransientNetworkError(errMsg: string): boolean {
+    return /fetch failed|econnreset|econnrefused|enotfound|etimedout|eai_again|epipe|socket hang up|terminated|network error|connection reset|connection refused|connect timeout|und_err/i.test(errMsg)
+  }
+
+  // 上游过载/瞬时 5xx（问题清单 #8「MODEL_TEMPORARILY_UNAVAILABLE / high load」）
+  private isUpstreamOverloadError(errMsg: string): boolean {
+    return /model_temporarily_unavailable|high load|overloaded|throttlingexception/i.test(errMsg) || /\b50[0234]\b/.test(errMsg)
+  }
+
+  // 402/429 配额/限流类错误（callWithRetry 与流式重试共用同一关键词集合）
+  private isQuotaThrottleError(errMsg: string): boolean {
+    return errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')
+  }
+
+  /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
+  private pickFailoverAccount(triedIds: Set<string>): ProxyAccount | null {
+    if (this.config.enableMultiAccount) {
+      return this.accountPool.getNextAccount(triedIds)
+    }
+    if (this.config.autoSwitchOnQuotaExhausted) {
+      return this.accountPool.getNextAvailableAccount(triedIds)
+    }
+    return null
+  }
+
+  /**
+   * 流式请求「首块前透明重试」决策：按错误类别给出下一个尝试账号 + 退避时长。
+   * 返回 null 表示不可重试（请求本身错误，或封禁/配额场景下已无可切账号）。
+   * 语义与 callWithRetry 各分支一一对应：
+   * 封禁 → 标记 + 切号；Auth → 刷新 Token 同号重试，失败切号；配额/限流 → 切号；
+   * 过载/网络瞬时错误 → 首次同号退避重试，持续失败切号。
+   */
+  private async resolveStreamRetry(
+    errMsg: string,
+    currentAccount: ProxyAccount,
+    triedIds: Set<string>,
+    attempt: number,
+    signal?: AbortSignal
+  ): Promise<{ account: ProxyAccount; delayMs: number } | null> {
+    const retryDelay = this.config.retryDelayMs || 1000
+
+    // 1) 账号被长期封禁（刷新也没用）→ 标记 + 切号
+    const suspendInfo = this.detectSuspendedError(errMsg)
+    if (suspendInfo) {
+      const newlyMarked = this.accountPool.markSuspended(currentAccount.id, suspendInfo.reason, suspendInfo.message)
+      if (newlyMarked) {
+        this.events.onAccountSuspended?.({
+          accountId: currentAccount.id,
+          email: currentAccount.email,
+          reason: suspendInfo.reason,
+          message: suspendInfo.message
+        })
+        this.appendAuditLog('account_suspended', {
+          accountId: currentAccount.id,
+          email: currentAccount.email,
+          reason: suspendInfo.reason
+        })
+        this.triggerWebhook('proxy-account-suspended', {
+          title: '反代账号被风控',
+          message: `账号 ${currentAccount.email || currentAccount.id.slice(0, 8)} 被 Kiro 后端标记为 ${suspendInfo.reason}，需要人工解封`,
+          level: 'error',
+          fields: {
+            邮箱: currentAccount.email || '-',
+            账号ID: currentAccount.id.slice(0, 8),
+            封禁原因: suspendInfo.reason,
+            详情: this.sanitizeErrorMessage(suspendInfo.message || '').slice(0, 200)
+          }
+        })
+      }
+      console.warn(`[ProxyServer] Stream: account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
+      const next = this.pickFailoverAccount(triedIds)
+      if (next && !triedIds.has(next.id)) {
+        triedIds.add(next.id)
+        if (!this.config.enableMultiAccount) {
+          this.config.selectedAccountIds = [next.id]
+          this.events.onAccountUpdate?.(next)
+        }
+        return { account: next, delayMs: 0 }
+      }
+      return null
+    }
+
+    // 2) 401/403: 尝试刷新 Token 同号重试；刷新失败切号
+    if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
+      const refreshed = await this.refreshToken(currentAccount, signal)
+      if (refreshed) {
+        return { account: this.accountPool.getAccount(currentAccount.id) || currentAccount, delayMs: 0 }
+      }
+      const next = this.pickFailoverAccount(triedIds)
+      if (next && !triedIds.has(next.id)) {
+        triedIds.add(next.id)
+        return { account: next, delayMs: 0 }
+      }
+      return null
+    }
+
+    // 3) 402/429 配额/限流 → 记录 RECOVERABLE + 切号
+    if (this.isQuotaThrottleError(errMsg)) {
+      this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+      const next = this.pickFailoverAccount(triedIds)
+      if (next && !triedIds.has(next.id)) {
+        triedIds.add(next.id)
+        if (!this.config.enableMultiAccount) {
+          this.config.selectedAccountIds = [next.id]
+          this.events.onAccountUpdate?.(next)
+        }
+        return { account: next, delayMs: 0 }
+      }
+      return null
+    }
+
+    // 4) 上游过载 / 网络瞬时错误 → 首次同号退避重试；持续失败切号（无号可切时退化为同号退避）
+    if (this.isUpstreamOverloadError(errMsg) || this.isTransientNetworkError(errMsg)) {
+      if (attempt > 0) {
+        const next = this.pickFailoverAccount(triedIds)
+        if (next && !triedIds.has(next.id)) {
+          triedIds.add(next.id)
+          return { account: next, delayMs: retryDelay * attempt }
+        }
+      }
+      return { account: currentAccount, delayMs: retryDelay * (attempt + 1) }
+    }
+
+    return null
+  }
+
   // 带重试的 API 调用
   private async callWithRetry<T>(
     account: ProxyAccount,
@@ -1359,16 +1487,6 @@ export class ProxyServer {
     let endpointIndex = 0
     // 本次请求累计已尝试的账号 ID，避免重试时循环命中已经失败过的账号
     const triedIds = new Set<string>([account.id])
-    /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
-    const switchToNextAccount = (): ProxyAccount | null => {
-      if (this.config.enableMultiAccount) {
-        return this.accountPool.getNextAccount(triedIds)
-      }
-      if (this.config.autoSwitchOnQuotaExhausted) {
-        return this.accountPool.getNextAvailableAccount(triedIds)
-      }
-      return null
-    }
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       this.throwIfAborted(signal)
@@ -1414,7 +1532,7 @@ export class ProxyServer {
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
           // 切到下个可用账号（跳过被 suspended 的 + 本请求已试过的）
-          const nextAccount = switchToNextAccount()
+          const nextAccount = this.pickFailoverAccount(triedIds)
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
@@ -1437,7 +1555,7 @@ export class ProxyServer {
             continue
           }
           // 刷新失败 → 切到没试过的下个账号
-          const nextAccount = switchToNextAccount()
+          const nextAccount = this.pickFailoverAccount(triedIds)
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
@@ -1446,13 +1564,13 @@ export class ProxyServer {
         }
 
         // 402/429: 额度耗尽，切换端点或账号
-        if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
+        if (this.isQuotaThrottleError(errMsg)) {
           console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
           this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
             // 已尝试所有端点，切换到没试过的下个账号
-            const nextAccount = switchToNextAccount()
+            const nextAccount = this.pickFailoverAccount(triedIds)
             if (nextAccount && !triedIds.has(nextAccount.id)) {
               console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
               currentAccount = nextAccount
@@ -1466,12 +1584,13 @@ export class ProxyServer {
           continue
         }
 
-        // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
-        if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
-          console.log('[ProxyServer] Server error, retrying')
+        // 上游过载(5xx/MODEL_TEMPORARILY_UNAVAILABLE)/网络瞬时错误(fetch failed 等):
+        // 同账号短退避重试一次；再次失败直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
+        if (this.isUpstreamOverloadError(errMsg) || this.isTransientNetworkError(errMsg)) {
+          console.log('[ProxyServer] Server/transient error, retrying')
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
           if (attempt > 0) {
-            const nextAccount = switchToNextAccount()
+            const nextAccount = this.pickFailoverAccount(triedIds)
             if (nextAccount && !triedIds.has(nextAccount.id)) {
               console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
               currentAccount = nextAccount
@@ -2762,30 +2881,47 @@ export class ProxyServer {
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal
   ): Promise<void> {
-    if (!headersSent) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      })
-    }
-
     const id = streamId || `chatcmpl-${uuidv4()}`
     let toolCallIndex = 0
     const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
     let collectedContent = ''
-    // 发送初始 chunk（仅首轮）
-    if (currentRound === 0) {
-      const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
-      res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
+
+    // 延迟发送 SSE 头 + 初始 chunk：等上游产出首个事件再写客户端，
+    // 首块前失败可透明重试或以真实 HTTP 状态码返回错误（与 handleClaudeStream 同策略）
+    let preambleSent = false
+    const ensurePreamble = (): void => {
+      if (preambleSent) return
+      preambleSent = true
+      if (!headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive'
+        })
+      }
+      // 发送初始 chunk（仅首轮）
+      if (currentRound === 0) {
+        const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
+        res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
+      }
     }
 
+    const maxStreamAttempts = this.config.maxRetries || 3
+
     return new Promise((resolve) => {
-      callKiroApiStream(
-        account as any,
+      // 首块前透明重试：尚未向客户端写出任何字节时，瞬时错误换端点/账号重试对客户端完全不可见
+      let attempt = 0
+      // 当前实际服务的账号（透明重试可能换号，成功统计需归属到真正服务的账号）
+      let activeAccount: { id: string; accessToken: string; profileArn?: string } = account
+      const triedIds = new Set<string>([account.id])
+      const startAttempt = (attemptAccount: { id: string; accessToken: string; profileArn?: string }): void => {
+        activeAccount = attemptAccount
+        callKiroApiStream(
+        attemptAccount as any,
         kiroPayload,
         (text, toolUse, isThinking) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          ensurePreamble()
           if (text && text.trim()) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 reasoning_content
@@ -2826,7 +2962,8 @@ export class ProxyServer {
             resolve()
             return
           }
-          
+          ensurePreamble()
+
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
           this.stats.inputTokens += usage.inputTokens
@@ -2837,10 +2974,10 @@ export class ProxyServer {
           this.stats.totalCredits += usage.credits || 0
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+          this.accountPool.recordSuccess(activeAccount.id, usage.inputTokens + usage.outputTokens)
           const oaiRespTime = Date.now() - startTime
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
+          this.recordRequest({ path: '/v1/chat/completions', model, accountId: activeAccount.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
             this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions')
@@ -2874,32 +3011,72 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error) => {
-          if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
-            resolve()
-            return
-          }
-          console.error('[ProxyServer] Stream error:', error)
-          res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
-          res.end()
-
-          this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
-          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
-          resolve()
-        },
+        (error): void => { handleStreamFailure(error, attemptAccount) },
         signal,
         this.config.preferredEndpoint
-      ).catch(error => {
-        if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
-          res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
-          res.end()
-          this.recordRequestFailed()
+      ).catch(error => handleStreamFailure(error as Error, attemptAccount))
+      }
+
+      // 首块前失败且仍有重试额度 → 透明换号/退避重试，对客户端完全不可见
+      const handleStreamFailure = (error: Error, failedAccount: { id: string }): void => {
+        if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+          resolve()
+          return
         }
+        console.error('[ProxyServer] Stream error:', error)
+
+        if (!preambleSent && attempt + 1 < maxStreamAttempts) {
+          this.resolveStreamRetry(
+            error.message || '',
+            this.accountPool.getAccount(failedAccount.id) || (failedAccount as unknown as ProxyAccount),
+            triedIds,
+            attempt,
+            signal
+          )
+            .then(retry => {
+              if (!retry) {
+                finishStreamFailure(error, failedAccount)
+                return
+              }
+              attempt++
+              const switched = retry.account.id !== failedAccount.id
+              console.warn(`[ProxyServer] OpenAI stream failed before first chunk, transparent retry ${attempt + 1}/${maxStreamAttempts}${switched ? ` on ${retry.account.email || retry.account.id.slice(0, 8)}` : ''}: ${(error.message || '').slice(0, 160)}`)
+              this.waitForRetry(retry.delayMs, signal)
+                .then(() => {
+                  if (signal?.aborted || this.isResponseClosed(res)) {
+                    resolve()
+                    return
+                  }
+                  startAttempt(retry.account)
+                })
+                .catch(() => resolve())
+            })
+            .catch(() => finishStreamFailure(error, failedAccount))
+          return
+        }
+        finishStreamFailure(error, failedAccount)
+      }
+
+      // 重试耗尽 / 不可重试错误的最终收尾
+      const finishStreamFailure = (error: Error, failedAccount: { id: string }): void => {
+        if (!preambleSent) {
+          // 尚未写出任何字节 → 以真实 HTTP 状态码返回 JSON 错误，客户端可正确识别错误类别
+          this.handleApiError(res, failedAccount, error, '/v1/chat/completions', model, startTime, signal)
+          resolve()
+          return
+        }
+        res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
+        res.end()
+
+        this.recordRequestFailed()
+        const errStatusCode = error.message.match(/(\d{3})/)?.[1]
+        this.accountPool.recordError(failedAccount.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+        this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
+        this.recordRequest({ path: '/v1/chat/completions', model, accountId: failedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
         resolve()
-      })
+      }
+
+      startAttempt(account)
     })
   }
 
@@ -3061,14 +3238,6 @@ export class ProxyServer {
     signal?: AbortSignal,
     simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
   ): Promise<void> {
-    if (!headersSent) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      })
-    }
-
     const id = msgId || `msg_${uuidv4()}`
     let currentBlockIndex = contentBlockIndex
     let hasStartedTextBlock = false
@@ -3089,30 +3258,55 @@ export class ProxyServer {
 
     // 估算输入 tokens（基于 payload 大小）
     const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3))
-    
-    // 发送 message_start（仅首轮）
-    if (currentRound === 0) {
-      const messageStart = createClaudeStreamEvent('message_start', {
-        message: {
-          id,
-          type: 'message',
-          role: 'assistant',
-          content: [],
-          model,
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: estimatedInputTokens, output_tokens: 0 }
-        }
-      })
-      res.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`)
+
+    // 延迟发送 SSE 头 + message_start：等上游产出首个事件再写客户端。
+    // 好处：上游在首块前失败（fetch failed / 500 高负载）时尚未向客户端写出任何字节，
+    // 可以透明换端点/换账号重试，或以真实 HTTP 状态码返回错误（而非 200 + SSE error 事件）。
+    let preambleSent = false
+    const ensurePreamble = (): void => {
+      if (preambleSent) return
+      preambleSent = true
+      if (!headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive'
+        })
+      }
+      // 发送 message_start（仅首轮）
+      if (currentRound === 0) {
+        const messageStart = createClaudeStreamEvent('message_start', {
+          message: {
+            id,
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: estimatedInputTokens, output_tokens: 0 }
+          }
+        })
+        res.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`)
+      }
     }
 
+    const maxStreamAttempts = this.config.maxRetries || 3
+
     return new Promise((resolve) => {
-      callKiroApiStream(
-        account as any,
+      // 首块前透明重试：尚未向客户端写出任何字节时，瞬时错误换端点/账号重试对客户端完全不可见
+      let attempt = 0
+      // 当前实际服务的账号（透明重试可能换号，成功统计需归属到真正服务的账号）
+      let activeAccount: { id: string; accessToken: string; profileArn?: string } = account
+      const triedIds = new Set<string>([account.id])
+      const startAttempt = (attemptAccount: { id: string; accessToken: string; profileArn?: string }): void => {
+        activeAccount = attemptAccount
+        callKiroApiStream(
+        attemptAccount as any,
         kiroPayload,
         (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          ensurePreamble()
           // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
           if (redactedContent) {
             if (hasStartedTextBlock) {
@@ -3240,6 +3434,7 @@ export class ProxyServer {
             resolve()
             return
           }
+          ensurePreamble()
           if (hasStartedThinkingBlock) {
             flushThinkingSignature()
             const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
@@ -3262,13 +3457,13 @@ export class ProxyServer {
           this.stats.totalCredits += usage.credits || 0
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+          this.accountPool.recordSuccess(activeAccount.id, usage.inputTokens + usage.outputTokens)
           this.stats.cacheReadTokens += usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens || 0
           this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0
           const respTime = Date.now() - startTime
           this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
-          this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
+          this.recordRequest({ path: '/v1/messages', model, accountId: activeAccount.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
             this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages')
@@ -3292,38 +3487,76 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error) => {
-          if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
-            resolve()
-            return
-          }
-          console.error('[ProxyServer] Stream error:', error)
-          const errorEvent = createClaudeStreamEvent('error', {
-            error: { type: 'api_error', message: error.message }
-          })
-          res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
-          res.end()
-
-          this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
-          this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
-          resolve()
-        },
+        (error): void => { handleStreamFailure(error, attemptAccount) },
         signal,
         this.config.preferredEndpoint
-      ).catch(error => {
-        if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
-          const errorEvent = createClaudeStreamEvent('error', {
-            error: { type: 'api_error', message: error.message }
-          })
-          res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
-          res.end()
-          this.recordRequestFailed()
+      ).catch(error => handleStreamFailure(error as Error, attemptAccount))
+      }
+
+      // 首块前失败且仍有重试额度 → 透明换号/退避重试，对客户端完全不可见
+      const handleStreamFailure = (error: Error, failedAccount: { id: string }): void => {
+        if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+          resolve()
+          return
         }
+        console.error('[ProxyServer] Stream error:', error)
+
+        if (!preambleSent && attempt + 1 < maxStreamAttempts) {
+          this.resolveStreamRetry(
+            error.message || '',
+            this.accountPool.getAccount(failedAccount.id) || (failedAccount as unknown as ProxyAccount),
+            triedIds,
+            attempt,
+            signal
+          )
+            .then(retry => {
+              if (!retry) {
+                finishStreamFailure(error, failedAccount)
+                return
+              }
+              attempt++
+              const switched = retry.account.id !== failedAccount.id
+              console.warn(`[ProxyServer] Claude stream failed before first chunk, transparent retry ${attempt + 1}/${maxStreamAttempts}${switched ? ` on ${retry.account.email || retry.account.id.slice(0, 8)}` : ''}: ${(error.message || '').slice(0, 160)}`)
+              this.waitForRetry(retry.delayMs, signal)
+                .then(() => {
+                  if (signal?.aborted || this.isResponseClosed(res)) {
+                    resolve()
+                    return
+                  }
+                  startAttempt(retry.account)
+                })
+                .catch(() => resolve())
+            })
+            .catch(() => finishStreamFailure(error, failedAccount))
+          return
+        }
+        finishStreamFailure(error, failedAccount)
+      }
+
+      // 重试耗尽 / 不可重试错误的最终收尾
+      const finishStreamFailure = (error: Error, failedAccount: { id: string }): void => {
+        if (!preambleSent) {
+          // 尚未写出任何字节 → 以真实 HTTP 状态码返回 JSON 错误（Anthropic 格式），
+          // 客户端可正确识别错误类别（此前一律 200 + SSE error 事件，客户端只能报 unknown）
+          this.handleApiError(res, failedAccount, error, '/v1/messages', model, startTime, signal)
+          resolve()
+          return
+        }
+        const errorEvent = createClaudeStreamEvent('error', {
+          error: { type: 'api_error', message: error.message }
+        })
+        res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+        res.end()
+
+        this.recordRequestFailed()
+        const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
+        this.accountPool.recordError(failedAccount.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+        this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
+        this.recordRequest({ path: '/v1/messages', model, accountId: failedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
         resolve()
-      })
+      }
+
+      startAttempt(account)
     })
   }
 
