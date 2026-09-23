@@ -836,6 +836,17 @@ const api = {
     }
   },
 
+  // 监听账号需要重新登录事件（refresh token 永久失效，如 IdC SSO session 到绝对上限）
+  onAccountNeedsRelogin: (callback: (info: { id: string; error: string; detectedAt: number }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: { id: string; error: string; detectedAt: number }): void => {
+      callback(info)
+    }
+    ipcRenderer.on('account-needs-relogin', handler)
+    return () => {
+      ipcRenderer.removeListener('account-needs-relogin', handler)
+    }
+  },
+
   // 监听反代账号更新事件（token 刷新 / Enterprise profileArn 自愈）
   onProxyAccountUpdate: (callback: (info: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string }) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, info: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string }): void => {

@@ -264,6 +264,38 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.11 (2026-9-23) — Token Lifecycle: Diagnosability, Terminal-State Detection, Cross-Region ARN Fallback
+
+All four fixes came out of investigating one real incident. The incident itself had two parts, and the diagnosis matters: **Kiro made no changes, and the refresh logic did not corrupt any token** — every problem was in the aftermath handling.
+
+- Frankfurt unavailable for ~15 minutes: every error was `fetch failed` with no HTTP status code, and `q.eu-central-1` failed alongside `GetUsageLimits`. That is network-layer unreachability, not a ban or throttle
+- All tokens invalid the next morning: 12 consecutive refreshes returned `expiresIn` decaying from 628s to 28s while the expiry instant stayed constant, meaning AWS pins the accessToken to the absolute end of the SSO session; when that instant passes the refresh token is invalidated with it. This is normal IAM Identity Center behavior (session ceiling is configured org-side, commonly 8/12 hours) and requires a fresh browser authorization
+
+#### 🐛 Error Objects Serialized to `{}`, Making Network Faults Undiagnosable
+
+- **Background**: `console.error('[OIDC] Refresh error:', error)` passed the Error instance directly, but `message`/`stack`/`name` are all non-enumerable, so `JSON.stringify(new Error('x'))` yields `{}`. During the incident all 57 `Refresh error` entries had empty data, making DNS failure / TLS reset / timeout indistinguishable
+- **Fix**: Errors are now normalized in the logger layer (rather than patching dozens of individual `console.error` call sites) into plain objects carrying `name`/`message`/`code`/`errno`/`syscall`/`stack`. **The `cause` chain and `AggregateError.errors` are expanded recursively** — undici's `fetch failed` is only a wrapper, and the real reason (`ENOTFOUND`/`ECONNRESET`/`UND_ERR_*`) lives solely in `cause`. This is the core value of the fix
+- **Supporting change**: normalization runs *before* redaction so tokens possibly embedded in `Error.message` are still masked; the console-interception path previously skipped redaction entirely and now applies it
+
+#### 🐛 `invalid_grant` Not Treated as Terminal, Retried Every 60 Seconds Forever
+
+- **Background**: the main pool scheduler only skipped accounts via `isBannedAccountErrorMain`, which recognizes suspensions and 423 only. `invalid_grant` unambiguously means "this refresh token is dead, retrying is pointless" — a distinct third failure class (transient network faults deserve retries, suspensions await manual unlock, this one needs re-login) that simply did not exist in the code. During the incident it burned 40+ pointless refreshes over 35 minutes with neither backoff nor a stop
+- **Fix**: new `isPermanentAuthFailure` predicate (`invalid_grant` / `invalid refresh token` / `invalid_client`), mirrored in main and renderer. Matching accounts are skipped by the scheduler until a re-login writes a new refreshToken and clears `lastError`, at which point scheduling resumes automatically
+
+#### 🐛 No User-Facing Signal After a Refresh Token Dies Permanently
+
+- **Background**: refresh failures only flowed back through `background-refresh-result`, leaving the account indistinguishable from an ordinary network failure in the UI. Users had to notice the symptoms themselves and then discover deleting and re-adding the account as the cure
+- **Fix**: account `status` is set to `expired` (distinct from the retryable `error`) with the reason recorded in `lastError`; a new `account-needs-relogin` IPC event lets the renderer persist through the existing failure branch; a desktop notification for "re-login required" mirrors the ban notification (8-second startup grace period + localStorage dedup to avoid spam during batch refreshes)
+- **Persistence**: reuses the proven suspension pattern — update the main-process in-memory snapshot and push IPC, letting the renderer debounce the write, avoiding a whole-store AES round trip per event
+
+#### 🐛 profileArn Fell Back to the Wrong Region's ARN on Probe Failure
+
+- **Background**: `listAvailableProfiles` returned an empty array both when the request failed (403 / unreachable) and when the region genuinely has no profile, making the two indistinguishable. During the incident `q.eu-central-1` failed and returned empty, so resolution fell back to the `us-east-1` ARN — the log honestly recorded `matched=false` and returned it anyway — immediately followed by `ListAvailableModels failed: 400 Invalid profileArn`
+- **Fix**: `listAvailableProfiles` now returns `{ profiles, failed }`, separating "unknown" from "confirmed empty". When the target region's probe fails without a match, resolution returns `undefined` and attaches no profileArn (callers degrade normally along the no-ARN path) and re-probes on the next call; the fallback applies only when the target region is **confirmed** to have no profile. This follows the existing principle that attaching no profileArn is safer than attaching one from the wrong region
+- **Logging**: "probe failed" and "region confirmed to have no profile" are now distinct, and only the latter suggests filling in profileArn manually
+
+---
+
 ### v1.7.10 (2026-9-13) — Transparent Retry for Transient Upstream Failures (fetch failed / 500 High Load)
 
 #### 🐛 Upstream "fetch failed" Was Passed Through With Zero Retries

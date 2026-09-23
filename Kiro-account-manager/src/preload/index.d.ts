@@ -701,6 +701,9 @@ interface KiroApi {
   // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
   onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void) => () => void
 
+  // 监听账号需要重新登录事件（refresh token 永久失效，如 IdC SSO session 到绝对上限）
+  onAccountNeedsRelogin: (callback: (info: { id: string; error: string; detectedAt: number }) => void) => () => void
+
   // 监听反代账号更新事件（token 刷新 / Enterprise profileArn 自愈）
   onProxyAccountUpdate: (callback: (info: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string }) => void) => () => void
 

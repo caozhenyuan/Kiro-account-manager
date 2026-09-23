@@ -366,6 +366,7 @@ const en = {
     networkError: 'Network error, please check your connection',
     authError: 'Authentication failed',
     tokenExpired: 'Token expired, please refresh',
+    needsRelogin: 'Refresh token invalidated (SSO session limit reached), please log in again',
     accountBanned: 'Account has been banned',
     invalidCredentials: 'Invalid credentials',
     importFailed: 'Import failed',

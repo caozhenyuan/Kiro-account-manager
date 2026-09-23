@@ -6,7 +6,7 @@ import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, Pro
 import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
-import { useAccountsStore, isBannedAccountError } from './store/accounts'
+import { useAccountsStore, isBannedAccountError, isPermanentAuthFailure } from './store/accounts'
 
 // 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
 const TRAY_UPDATE_DEBOUNCE_MS = 400
@@ -113,6 +113,22 @@ function App(): React.JSX.Element {
     return unsubscribe
   }, [loadFromStorage])
 
+  // 订阅「账号需要重新登录」事件（主进程检测到 refresh token 永久失效时推送）
+  // 走 handleBackgroundRefreshResult 复用既有失败分支：写 status='expired' + lastError + 防抖落盘，
+  // 不另开一条持久化路径
+  useEffect(() => {
+    if (typeof window.api.onAccountNeedsRelogin !== 'function') return
+    const unsubscribe = window.api.onAccountNeedsRelogin((info) => {
+      console.warn(`[App] Account ${info.id} needs re-login: ${info.error}`)
+      useAccountsStore.getState().handleBackgroundRefreshResult({
+        id: info.id,
+        success: false,
+        error: info.error
+      })
+    })
+    return unsubscribe
+  }, [])
+
   // 反代关键事件 → 触发 webhook（v1.8 新增）
   // 由 main/proxyServer 内置的 webhookTrigger 通过 IPC 推送过来，统一在 renderer 调 useWebhookStore
   useEffect(() => {
@@ -195,6 +211,52 @@ function App(): React.JSX.Element {
 
     // 持久化当前仍封禁的集合：已解封的移出（将来再次封禁可重新提醒），新封禁的记入避免重复弹
     try { localStorage.setItem(KEY, JSON.stringify(currentBanned)) } catch { /* ignore */ }
+  }, [accounts])
+
+  // refresh token 永久失效 → 桌面通知提示重新登录
+  // 与封禁通知同构（8s 启动宽限期 + localStorage 去重），但语义不同：
+  // 封禁要等人工解封，这里只需用户重新走一次浏览器登录。
+  // 触发场景：IdC SSO session 到组织侧配置的绝对上限，refresh token 同步作废。
+  const reloginNotifyStartRef = useRef(Date.now())
+  useEffect(() => {
+    if (typeof Notification === 'undefined') return
+    const KEY = 'kiro-notified-relogin-ids'
+    let notifiedSet: Set<string>
+    try {
+      notifiedSet = new Set<string>(JSON.parse(localStorage.getItem(KEY) || '[]'))
+    } catch {
+      notifiedSet = new Set<string>()
+    }
+
+    const current: string[] = []
+    const fresh: { email: string; nickname?: string }[] = []
+    for (const a of accounts.values()) {
+      if (isPermanentAuthFailure(a.lastError)) {
+        current.push(a.id)
+        if (!notifiedSet.has(a.id)) fresh.push({ email: a.email, nickname: a.nickname })
+      }
+    }
+
+    const inGracePeriod = Date.now() - reloginNotifyStartRef.current < 8000
+    if (!inGracePeriod && fresh.length > 0 && Notification.permission !== 'denied') {
+      const fire = (): void => {
+        const lang = useAccountsStore.getState().language
+        const isEn = lang === 'en' || (lang === 'auto' && !navigator.language.startsWith('zh'))
+        const title = fresh.length === 1
+          ? (isEn ? 'Re-login required' : '需要重新登录')
+          : (isEn ? `${fresh.length} accounts need re-login` : `${fresh.length} 个账号需要重新登录`)
+        const names = fresh.slice(0, 3).map((a) => a.nickname || a.email)
+        const detail = isEn
+          ? 'Refresh token expired (SSO session limit reached)'
+          : 'refresh token 已失效（SSO 会话到达上限）'
+        const body = names.join('\n') + (fresh.length > 3 ? (isEn ? `\n+${fresh.length - 3} more` : `\n等 ${fresh.length} 个`) : '') + `\n${detail}`
+        try { new Notification(title, { body }) } catch { /* ignore */ }
+      }
+      if (Notification.permission === 'granted') fire()
+      else void Notification.requestPermission().then((p) => { if (p === 'granted') fire() })
+    }
+
+    try { localStorage.setItem(KEY, JSON.stringify(current)) } catch { /* ignore */ }
   }, [accounts])
 
   // 关闭/刷新前强制 flush 防抖中的待保存数据，防止数据丢失

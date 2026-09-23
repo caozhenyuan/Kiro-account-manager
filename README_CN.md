@@ -264,6 +264,38 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.7.11 (2026-9-23) — Token 生命周期：故障诊断能力 + 终态识别 + ARN 跨区回落
+
+本次四条均来自一次真实故障的日志排查。故障本身有两段，定性先说清楚：**Kiro 官方没有改动，刷新逻辑也没把 token 刷坏**——问题全在事后处理。
+
+- 法兰克福区域十几分钟不可用：错误全是 `fetch failed` 且无 HTTP 状态码，`q.eu-central-1` 与 `GetUsageLimits` 同时失败，是网络层连不通，不是封禁或限流
+- 次日 token 全面失效：连续刷新 12 次，`expiresIn` 从 628s 递减到 28s 而到期时刻恒定不变，说明 AWS 把 accessToken 钉死在 SSO session 的绝对终点；终点一到 refresh token 同步作废。这是 IAM Identity Center 的正常设计（session 上限由组织侧配置，常见 8/12 小时），到点必须重新走浏览器授权
+
+#### 🐛 Error 对象被序列化成 `{}`，网络故障无法诊断
+
+- **背景**: `console.error('[OIDC] Refresh error:', error)` 直传 Error 实例，而 Error 的 `message`/`stack`/`name` 都是非枚举属性，`JSON.stringify(new Error('x'))` 得到 `{}`。故障期间 57 条 `Refresh error` 的 data 全是空对象，DNS 失败 / TLS 重置 / 超时完全分不出来
+- **修复**: 在 logger 层统一归一化 Error（而非逐个修改几十处 `console.error` 调用点），转成含 `name`/`message`/`code`/`errno`/`syscall`/`stack` 的纯对象。**递归展开 `cause` 链与 `AggregateError.errors`**——undici 的 `fetch failed` 只是包装错误，真实原因（`ENOTFOUND`/`ECONNRESET`/`UND_ERR_*`）只存在于 cause 里，这是本条修复的核心价值
+- **配套**: 归一化在脱敏**之前**执行，保证 `Error.message` 里可能夹带的 token 仍被打码；console 拦截路径此前不经过脱敏，本次补上
+
+#### 🐛 `invalid_grant` 不识别为终态，每 60 秒无限重刷
+
+- **背景**: 主池调度器只用 `isBannedAccountErrorMain` 跳过账号，它仅识别封禁与 423。`invalid_grant` 语义明确是「此 refresh token 已死，重试无意义」，属于独立的第三类失败（网络抖动值得重试、封禁等人工解封、本类需重新登录），代码里不存在该分类。故障期间 35 分钟内白刷 40 余次，既无退避也不停止
+- **修复**: 新增 `isPermanentAuthFailure` 判定（`invalid_grant` / `invalid refresh token` / `invalid_client`），主进程与渲染进程各一份。命中后主池调度跳过该账号，直到重新登录写入新 refreshToken 并清空 `lastError` 时自动恢复
+
+#### 🐛 refresh token 永久失效后用户无任何提示
+
+- **背景**: 刷新失败仅回流 `background-refresh-result`，UI 上账号状态与普通网络失败无从区分。用户只能自己察觉异常，再靠删号重登试出来
+- **修复**: 账号 `status` 置 `expired`（区别于可重试的 `error`），`lastError` 写明原因；新增 `account-needs-relogin` IPC 事件，渲染进程收到后复用既有失败分支落盘；桌面通知新增「需要重新登录」提示，与封禁通知同构（8 秒启动宽限期 + localStorage 去重，避免批量刷新时刷屏）
+- **持久化**: 沿用封禁事件的成熟模式——只更新主进程内存快照 + 推 IPC，由渲染进程防抖落盘，避免每次触发都做整库 AES 加解密
+
+#### 🐛 profileArn 探测失败时回落到错误区域的 ARN
+
+- **背景**: `listAvailableProfiles` 在请求失败（403 / 网络不通）时返回空数组，与「该区域确实没有 profile」返回的空数组无法区分。故障期间 `q.eu-central-1` 抓包失败返回空，于是回落到 `us-east-1` 的 ARN——日志诚实记录了 `matched=false` 却照样返回——紧接着 `ListAvailableModels failed: 400 Invalid profileArn`
+- **修复**: `listAvailableProfiles` 返回 `{ profiles, failed }` 区分「不知道」与「确认没有」。目标区域探测失败且未命中时返回 `undefined`，不附加 profileArn（调用方按无 ARN 路径正常降级），下次调用重试探测；仅在目标区域**确认无** profile 时才沿用回落。依据既有原则：不附加 profileArn 比附加错区域的更安全
+- **日志**: 区分「探测失败」与「该区域确认无 profile」，只有后者才提示手动填写 profileArn
+
+---
+
 ### v1.7.10 (2026-9-13) — 反代瞬时故障透明重试（fetch failed / 500 高负载）
 
 #### 🐛 上游「fetch failed」零重试直抛客户端修复

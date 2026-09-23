@@ -2358,11 +2358,18 @@ function getCodeWhispererEndpoint(region?: string): string {
 // 根据账号区域获取 CodeWhisperer Runtime 端点
 
 /** 向指定 base 发一次 ListAvailableProfiles，返回 profiles 数组（失败返回空数组）。 */
+/**
+ * 探测某端点下可用的 profile 列表。
+ *
+ * 返回 failed 标志而非只返回数组：请求失败（403/网络不通）与「该区域确实没有 profile」
+ * 都会得到空列表，但语义相反——前者是"不知道"，后者是"确认没有"。调用方必须区分，
+ * 否则探测失败会被误判成该区域无 profile，从而回落到别区域的 ARN（→ 400 Invalid profileArn）。
+ */
 async function listAvailableProfiles(
   baseUrl: string,
   account: ProxyAccount,
   machineId: string | undefined
-): Promise<Array<{ arn?: string; profileName?: string }>> {
+): Promise<{ profiles: Array<{ arn?: string; profileName?: string }>; failed: boolean }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${account.accessToken}`,
@@ -2380,13 +2387,15 @@ async function listAvailableProfiles(
     if (!response.ok) {
       const errBody = await response.text().catch(() => '')
       console.error(`[KiroAPI] ListAvailableProfiles(${baseUrl}) failed: ${response.status}`, errBody.slice(0, 200))
-      return []
+      return { profiles: [], failed: true }
     }
     const data = await response.json() as { profiles?: Array<{ arn?: string; profileName?: string }> }
-    return data.profiles || []
+    return { profiles: data.profiles || [], failed: false }
   } catch (error) {
-    console.error(`[KiroAPI] ListAvailableProfiles(${baseUrl}) error:`, error instanceof Error ? error.message : error)
-    return []
+    // 传 Error 本身而非 .message：logger 会归一化并展开 cause 链，
+    // fetch failed 的真实原因（ENOTFOUND / ECONNRESET）才能落进日志
+    console.error(`[KiroAPI] ListAvailableProfiles(${baseUrl}) error:`, error)
+    return { profiles: [], failed: true }
   }
 }
 
@@ -2398,33 +2407,49 @@ async function listAvailableProfiles(
  * 不含其它区域。因此：
  *   1. 先用 codewhisperer.us-east-1 发现（拿到 us-east-1 profile）；
  *   2. 若目标额度区域(apiRegion) 非 us-east-1 且未命中，则改用 q.{apiRegion} 发现该区域 profile；
- *   3. 优先返回与 apiRegion 匹配的 ARN，否则回落第一个。
+ *   3. 优先返回与 apiRegion 匹配的 ARN。
+ *
+ * 跨区域回落的边界：目标区域**探测失败**（403/网络不通）时返回 undefined，绝不回落到
+ * 别区域的 ARN。依据 resolveProfileArn 的既有原则——不附加 profileArn 比附加错区域的更安全：
+ * 前者请求能正常降级，后者必然 400 Invalid profileArn。
+ * 只有在目标区域**确认没有** profile 时，才回落到已发现的第一个（可能是别区域的）。
  */
 export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
   const machineId = getAccountMachineId(account.id, account.machineId)
   const wantHost = regionHost(getApiRegion(account))
 
   // 1) CodeWhisperer runtime（us-east-1）
-  let profiles = await listAvailableProfiles(getCodeWhispererEndpoint('us-east-1'), account, machineId)
+  const local = await listAvailableProfiles(getCodeWhispererEndpoint('us-east-1'), account, machineId)
+  let profiles = local.profiles
   let matched = profiles.find(p => typeof p.arn === 'string' && p.arn.includes(`:codewhisperer:${wantHost}:`))
   let via = 'codewhisperer.us-east-1'
+  // 目标区域的探测是否失败（"不知道"而非"确认没有"）
+  let wantProbeFailed = wantHost === 'us-east-1' ? local.failed : false
 
   // 2) 远区未命中 → 用 Amazon Q 区域端点 q.{apiRegion} 发现该区域 profile
   if (!matched && wantHost !== 'us-east-1') {
     const remote = await listAvailableProfiles(getQServiceEndpoint(wantHost), account, machineId)
-    if (remote.length > 0) {
-      const remoteMatch = remote.find(p => typeof p.arn === 'string' && p.arn.includes(`:codewhisperer:${wantHost}:`))
-      profiles = remote
-      matched = remoteMatch || remote[0]
+    wantProbeFailed = remote.failed
+    if (remote.profiles.length > 0) {
+      const remoteMatch = remote.profiles.find(p => typeof p.arn === 'string' && p.arn.includes(`:codewhisperer:${wantHost}:`))
+      profiles = remote.profiles
+      matched = remoteMatch || remote.profiles[0]
       via = `q.${wantHost}`
     }
+  }
+
+  // 目标区域探测失败且未命中 → 不猜。回落别区 ARN 会让后续请求必然 400，
+  // 不如不附加 profileArn（调用方会按无 ARN 的路径降级），下次调用再重试探测。
+  if (!matched && wantProbeFailed) {
+    console.warn(`[KiroAPI] Enterprise profileArn 探测失败（want=${wantHost}）：ListAvailableProfiles 请求未成功，本次不附加 profileArn（不回落到其它区域的 ARN，避免 400 Invalid profileArn）。若持续失败请检查网络或在编辑账号里手动填写。`)
+    return undefined
   }
 
   const arn = matched?.arn || profiles[0]?.arn
   if (arn) {
     console.log(`[KiroAPI] Enterprise profileArn resolved (want=${wantHost}, via=${via}, matched=${!!matched}, total=${profiles.length}): ${arn}`)
   } else {
-    console.warn(`[KiroAPI] Enterprise profileArn 未解析到（want=${wantHost}）：ListAvailableProfiles 无返回或该区域不支持发现，请在编辑账号里手动填写 profileArn。`)
+    console.warn(`[KiroAPI] Enterprise profileArn 未解析到（want=${wantHost}）：该区域确认无可用 profile，请在编辑账号里手动填写 profileArn。`)
   }
   return arn || undefined
 }

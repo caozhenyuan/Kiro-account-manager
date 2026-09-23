@@ -234,6 +234,22 @@ export function isBannedAccountError(error?: string): boolean {
   return false
 }
 
+/**
+ * refresh token 是否已永久失效（需要重新走浏览器登录，重试无意义）。
+ * 镜像主进程的 isPermanentAuthFailureMain。
+ *
+ * 典型来源：AWS IAM Identity Center 的 SSO session 达到组织侧配置的绝对上限
+ * （常见 8/12 小时）。到点后刷新固定返回 400 {"error":"invalid_grant"}，
+ * 与封禁（等人工解封）、网络抖动（值得重试）是三类不同的失败。
+ */
+export function isPermanentAuthFailure(error?: string): boolean {
+  if (!error) return false
+  const e = error.toLowerCase()
+  return e.includes('invalid_grant')
+    || e.includes('invalid refresh token')
+    || e.includes('invalid_client')
+}
+
 // 自动换号定时器
 let autoSwitchTimer: ReturnType<typeof setInterval> | null = null
 
@@ -2471,7 +2487,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         if (!success) {
           accounts.set(id, {
             ...account,
-            status: 'error',
+            // refresh token 永久失效用 'expired' 而非 'error'：前者语义是「凭证到期需重新登录」，
+            // 后者会被当成可重试的异常，UI 上也无从区分
+            status: isPermanentAuthFailure(error) ? 'expired' : 'error',
             lastError: error,
             lastCheckedAt: now
           })
@@ -2588,7 +2606,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         if (!success) {
           accounts.set(id, {
             ...account,
-            status: 'error',
+            // refresh token 永久失效用 'expired' 而非 'error'：前者语义是「凭证到期需重新登录」，
+            // 后者会被当成可重试的异常，UI 上也无从区分
+            status: isPermanentAuthFailure(error) ? 'expired' : 'error',
             lastError: error,
             lastCheckedAt: now
           })

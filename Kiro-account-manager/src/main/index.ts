@@ -1952,6 +1952,27 @@ function isBannedAccountErrorMain(error?: string): boolean {
 }
 
 /**
+ * 判定 refresh token 是否已永久失效（重试无意义，必须重新走浏览器登录）。
+ *
+ * 与封禁、与网络抖动都不同，是第三类终态：
+ *   - 网络抖动 → 值得重试
+ *   - 封禁     → 跳过该账号，等人工解封
+ *   - 本类     → refresh token 本身作废，再刷多少次都是同样的 400
+ *
+ * 触发场景：AWS IAM Identity Center 的 SSO session 有组织侧配置的绝对上限
+ * （常见 8/12 小时）。到点后 accessToken 的 expiresAt 被钉死在 session 终点，
+ * 刷新只会返回越来越小的 expiresIn，终点一到 refresh token 同步作废，
+ * 此后固定返回 400 {"error":"invalid_grant"}。这是 IdC 的正常设计，不是故障。
+ */
+function isPermanentAuthFailureMain(error?: string): boolean {
+  if (!error) return false
+  const e = error.toLowerCase()
+  return e.includes('invalid_grant')
+    || e.includes('invalid refresh token')
+    || e.includes('invalid_client')
+}
+
+/**
  * 判定是否为「token 过期 / 无效」类错误，需要刷新 token 后重试。
  * CodeWhisperer/Q 对过期 token 返回的是 403（非 401），文案如：
  * "Token expired" / "The bearer token included in the request is invalid." /
@@ -1966,6 +1987,55 @@ function isExpiredTokenErrorMain(error?: string): boolean {
     || e.includes('invalid bearer token')
     || e.includes('security token included in the request is expired')
     || e.includes('expired token')
+}
+
+/**
+ * 已判定需要重新登录的账号 ID。
+ *
+ * 主池 tick 读的是 store 里的 lastError，而 lastError 要等 renderer 收 IPC 后防抖落盘才可见；
+ * 若窗口已销毁（关到托盘等场景）IPC 落空，store 永远不会被更新，tick 就会一直重刷。
+ * 这个内存集合让"停止重刷"不依赖 renderer 往返，进程内立即生效。
+ */
+const needsReloginAccountIds = new Set<string>()
+
+/**
+ * 已失效的 refreshToken 快照（accountId → 当时那个死 token）。
+ * save-accounts 时比对：token 变了说明用户重新登录过，解除终态标记恢复调度。
+ * 不能只看"有没有 token"——重新登录常复用同一账号 ID，不比对就永远解除不了。
+ */
+const needsReloginRefreshTokens = new Map<string, string>()
+
+/**
+ * 标记账号需要重新登录：写 status/lastError + 推 IPC 通知 UI。
+ *
+ * 持久化策略与 onAccountSuspended 一致——只更新 lastSavedData 内存快照并推 IPC，
+ * 由 renderer store 防抖落盘。不直接 store.get + store.set，避免整库 AES 加解密阻塞主进程。
+ */
+function markAccountNeedsRelogin(accountId: string, error?: string, deadRefreshToken?: string): void {
+  needsReloginAccountIds.add(accountId)
+  if (deadRefreshToken) needsReloginRefreshTokens.set(accountId, deadRefreshToken)
+  const lastError = error || 'invalid_grant: refresh token 已失效，请重新登录'
+  try {
+    if (lastSavedData && typeof lastSavedData === 'object') {
+      const data = lastSavedData as { accounts?: Record<string, Record<string, unknown>> }
+      if (data.accounts?.[accountId]) {
+        data.accounts[accountId] = {
+          ...data.accounts[accountId],
+          status: 'expired',
+          lastError,
+          lastCheckedAt: Date.now()
+        }
+      }
+    }
+    mainWindow?.webContents.send('account-needs-relogin', {
+      id: accountId,
+      error: lastError,
+      detectedAt: Date.now()
+    })
+    console.warn(`[MainPoolRefresh] Account ${accountId} needs re-login (refresh token permanently invalid), stopped auto-refresh`)
+  } catch (e) {
+    console.warn('[MainPoolRefresh] Failed to mark needs-relogin state:', e)
+  }
 }
 
 /** 刷新提前量：≥ 2× 检查间隔且不少于 10 分钟，确保 token 不会在两次 tick 之间过期。 */
@@ -2017,6 +2087,10 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
       const creds = acc?.credentials
       if (!creds?.refreshToken) continue
       if (isBannedAccountErrorMain(acc.lastError)) continue
+      // refresh token 已永久失效：再刷也是同样的 400，跳过直到用户重新登录
+      // 两个来源都查：内存集合（本进程已判定，不依赖 renderer 落盘往返）+
+      // store 里的 lastError（覆盖重启后仍未重新登录的情况）
+      if (needsReloginAccountIds.has(id) || isPermanentAuthFailureMain(acc.lastError)) continue
       const expiresAt = creds.expiresAt
       // 只刷"即将过期/已过期"的；没有 expiresAt 的跳过（无从判断）
       if (!expiresAt || expiresAt - now > leadMs) continue
@@ -3022,6 +3096,28 @@ app.whenReady().then(async () => {
       // 保存最后的数据（用于崩溃恢复）
       lastSavedData = data
 
+      // 解除 needs-relogin 终态：用户重新登录后 refreshToken 会变，
+      // 此时必须放开主池调度，否则新凭证也不会被刷新（内存标记按账号 ID 记，
+      // 重新登录复用同一 ID 时不解除就会死锁）。
+      // 比对 refreshToken 而非清空全部：同一次落盘里其它账号的终态要保留。
+      if (needsReloginAccountIds.size > 0) {
+        try {
+          const accts = (data as { accounts?: Record<string, { credentials?: { refreshToken?: string } }> } | null)?.accounts
+          if (accts) {
+            for (const id of [...needsReloginAccountIds]) {
+              const rt = accts[id]?.credentials?.refreshToken
+              if (rt && rt !== needsReloginRefreshTokens.get(id)) {
+                needsReloginAccountIds.delete(id)
+                needsReloginRefreshTokens.delete(id)
+                console.log(`[MainPoolRefresh] Account ${id} got a new refreshToken, resumed auto-refresh`)
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('[MainPoolRefresh] Failed to evaluate needs-relogin release:', e)
+        }
+      }
+
       // 账号保存时，把 apiRegion 变化同步到运行中的反代账号池（与当前停留在哪个页面无关）。
       // 这样在账号页/编辑框切换额度区域时，反代会立即改用新区域；旧 profileArn 一并清空，
       // 下次请求由跨区域自愈按新区域重新解析，避免反代仍用旧区域计费。
@@ -3759,6 +3855,11 @@ app.whenReady().then(async () => {
               if (!refreshResult.success) {
                 failed++
                 completed++
+                // refresh token 永久失效（SSO session 到绝对上限）→ 标记终态，
+                // 让主池调度器停止每分钟重刷，并让 UI 提示用户重新登录
+                if (isPermanentAuthFailureMain(refreshResult.error) && account.id) {
+                  markAccountNeedsRelogin(account.id, refreshResult.error, refreshToken)
+                }
                 // 通知渲染进程刷新失败
                 mainWindow?.webContents.send('background-refresh-result', {
                   id: account.id,
@@ -3766,6 +3867,12 @@ app.whenReady().then(async () => {
                   error: refreshResult.error
                 })
                 return
+              }
+
+              // 刷新成功说明已换上可用的 refreshToken（用户重新登录过）→ 解除终态标记，恢复调度
+              if (account.id) {
+                needsReloginAccountIds.delete(account.id)
+                needsReloginRefreshTokens.delete(account.id)
               }
 
               newAccessToken = refreshResult.accessToken || accessToken

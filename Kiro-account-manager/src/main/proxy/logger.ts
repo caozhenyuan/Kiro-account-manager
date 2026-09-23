@@ -20,6 +20,71 @@ export interface LoggerConfig {
   logToConsole?: boolean
 }
 
+/** Error 归一化后的形状；stack 截断，cause 递归展开 */
+interface NormalizedError {
+  name: string
+  message: string
+  code?: string
+  errno?: number
+  syscall?: string
+  stack?: string
+  cause?: unknown
+  errors?: unknown[]
+}
+
+/** stack 保留行数：足够定位调用点，又不让单条日志膨胀 */
+const STACK_LINES = 4
+
+/**
+ * 把 Error 转成可 JSON 序列化的纯对象。
+ *
+ * 必要性：Error 的 message/stack/name 都是非枚举属性，JSON.stringify(new Error('x')) === '{}'。
+ * 日志里 console.error('...', error) 直传 Error 时，data 会整条丢成 {}，
+ * 网络故障（DNS/TLS/超时）因此完全无法区分。
+ *
+ * undici 的 `fetch failed` 是包装错误，真实原因（ENOTFOUND / ECONNRESET / UND_ERR_*）
+ * 只在 cause 链里，所以必须递归展开——这是本函数的主要价值。
+ */
+function normalizeError(err: Error, depth = 0): NormalizedError {
+  const e = err as Error & { code?: string; errno?: number; syscall?: string; cause?: unknown; errors?: unknown[] }
+  const out: NormalizedError = {
+    name: e.name || 'Error',
+    message: e.message || String(e)
+  }
+  if (e.code !== undefined) out.code = String(e.code)
+  if (typeof e.errno === 'number') out.errno = e.errno
+  if (e.syscall !== undefined) out.syscall = String(e.syscall)
+  if (typeof e.stack === 'string') {
+    out.stack = e.stack.split('\n').slice(0, STACK_LINES).join('\n')
+  }
+  // cause 链递归展开（限深，防御自引用与超长链）
+  if (e.cause !== undefined && e.cause !== null && depth < 4) {
+    out.cause = e.cause instanceof Error ? normalizeError(e.cause, depth + 1) : e.cause
+  }
+  // AggregateError.errors（Node 在多地址连接全部失败时用它聚合）
+  if (Array.isArray(e.errors) && depth < 4) {
+    out.errors = e.errors.map((sub) => (sub instanceof Error ? normalizeError(sub, depth + 1) : sub))
+  }
+  return out
+}
+
+/**
+ * 递归把值里的 Error 实例换成归一化纯对象。
+ * 必须在 redactValue 之前调用：归一化后 message/stack 变成普通字符串属性，
+ * 才能被脱敏逻辑扫到（否则 token 可能藏在 Error.message 里逃过脱敏）。
+ */
+export function normalizeErrors(value: unknown, depth = 0): unknown {
+  if (value instanceof Error) return normalizeError(value)
+  if (value == null || typeof value !== 'object' || depth >= 6) return value
+  if (Array.isArray(value)) return value.map((v) => normalizeErrors(v, depth + 1))
+  // 只在含 Error 时重建对象，避免给每条日志都多复制一层
+  const entries = Object.entries(value as Record<string, unknown>)
+  if (!entries.some(([, v]) => v instanceof Error || (v !== null && typeof v === 'object'))) return value
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of entries) out[k] = normalizeErrors(v, depth + 1)
+  return out
+}
+
 const DEFAULT_CONFIG: LoggerConfig = {
   enabled: false,
   maxFileSize: 10 * 1024 * 1024, // 10MB
@@ -109,10 +174,11 @@ class ProxyLogger {
   private isWriting = false
   private write(rawEntry: LogEntry): void {
     // 统一脱敏：message + data 里的代理账密 / token / password 等，避免明文落盘或上屏
+    // Error 先归一化再脱敏，否则 JSON.stringify 会把 Error 整条丢成 {}
     const entry: LogEntry = {
       ...rawEntry,
       message: redactString(rawEntry.message),
-      data: rawEntry.data === undefined ? undefined : redactValue(rawEntry.data)
+      data: rawEntry.data === undefined ? undefined : redactValue(normalizeErrors(rawEntry.data))
     }
     const line = JSON.stringify(entry) + '\n'
 
@@ -405,7 +471,17 @@ export function interceptConsole(): void {
       const allStrings = rest.every(r => typeof r === 'string')
       data = allStrings ? (rest as string[]).join(' ') : rest
     }
-    return { timestamp: new Date().toISOString(), level, category, message, data }
+    // console.error('[X] msg:', error) 是主进程最常见写法，Error 必须在此归一化，
+    // 否则 proxyLogStore.add 直接存原始 Error，落盘 JSON.stringify 后只剩 {}。
+    // 这条路径不经过 ProxyLogger.write，脱敏要在此自行施加：归一化把 Error.message
+    // 变成可见字符串属性，其中可能含 token（如 "Auth error 403: {...accessToken...}"）。
+    return {
+      timestamp: new Date().toISOString(),
+      level,
+      category,
+      message: redactString(message),
+      data: data === undefined ? undefined : redactValue(normalizeErrors(data))
+    }
   }
 
   console.log = (...args: unknown[]) => {

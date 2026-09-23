@@ -366,6 +366,7 @@ const zh = {
     networkError: '网络错误，请检查网络连接',
     authError: '认证失败',
     tokenExpired: 'Token 已过期，请刷新',
+    needsRelogin: 'refresh token 已失效（SSO 会话到达上限），请重新登录',
     accountBanned: '账号已被封禁',
     invalidCredentials: '凭证无效',
     importFailed: '导入失败',
