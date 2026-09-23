@@ -278,6 +278,11 @@ npx electron-builder --linux --arm64
 - **归属修正**: 流式透明重试换号成功后，成功统计（tokens/credits/请求记录）归属到真正服务的账号
 - **验证**: 新增 `test/smoke-retry.mts` 冒烟测试（伪造 AWS 上游）：fetch failed + 500 高负载流式透明重试成功、持续 500 返回真实 HTTP 500、非流式 fetch failed 重试成功
 
+#### 🐛 透明重试的并发写与重复记账加固
+
+- **尝试代号隔离**: `callKiroApiStream` 的 `onError` 无去重保护（`parseEventStream` 内部 catch 调一次后，外层端点循环结束会用 `lastError` 再调一次），同一次调用可能触发两次失败回调。此前两次会各自触发一次重试，两条上游流并发写同一个 `res`，SSE 帧交错。现在每次尝试持有自增代号，`onChunk`/`onComplete`/`onError` 都先比对代号，只受理当前尝试的回调
+- **记账去重**: 配额/限流分支改为仅在「本次失败被换号消化掉」时 `recordError`；无号可切返回 null 时留给 `handleApiError` 统一记账。此前两处都记，断路器的指数退避按双倍步进累积，把瞬时故障放大成长时间冷却
+
 ---
 
 ### v1.7.9 (2026-8-28) — 流式输出重复文本/前缀加固 + 原始流诊断日志

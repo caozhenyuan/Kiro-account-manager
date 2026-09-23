@@ -1445,9 +1445,11 @@ export class ProxyServer {
 
     // 3) 402/429 配额/限流 → 记录 RECOVERABLE + 切号
     if (this.isQuotaThrottleError(errMsg)) {
-      this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
       const next = this.pickFailoverAccount(triedIds)
       if (next && !triedIds.has(next.id)) {
+        // 仅在本函数消化掉这次失败（换号继续）时记账；返回 null 时由调用方的
+        // handleApiError 统一 recordError，两处都记会让断路器退避时长翻倍累积
+        this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
         triedIds.add(next.id)
         if (!this.config.enableMultiAccount) {
           this.config.selectedAccountIds = [next.id]
@@ -2914,12 +2916,19 @@ export class ProxyServer {
       // 当前实际服务的账号（透明重试可能换号，成功统计需归属到真正服务的账号）
       let activeAccount: { id: string; accessToken: string; profileArn?: string } = account
       const triedIds = new Set<string>([account.id])
+      // 当前尝试代号。callKiroApiStream 的 onError 无去重保护，同一次调用可能触发多次
+      // （parseEventStream 内部 catch 调 onError 后，外层端点循环结束还会再调一次）。
+      // 每次尝试持有自己的 generation，只有等于当前值的回调才被受理，
+      // 否则迟到失败会各自触发一次重试，两条上游流并发写同一个 res 导致 SSE 帧交错。
+      let generation = 0
       const startAttempt = (attemptAccount: { id: string; accessToken: string; profileArn?: string }): void => {
         activeAccount = attemptAccount
+        const myGeneration = ++generation
         callKiroApiStream(
         attemptAccount as any,
         kiroPayload,
         (text, toolUse, isThinking) => {
+          if (myGeneration !== generation) return
           if (signal?.aborted || this.isResponseClosed(res)) return
           ensurePreamble()
           if (text && text.trim()) {
@@ -2958,6 +2967,7 @@ export class ProxyServer {
           return this.waitForDrain(res)
         },
         async (usage) => {
+          if (myGeneration !== generation) return
           if (signal?.aborted || this.isResponseClosed(res)) {
             resolve()
             return
@@ -3011,14 +3021,16 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error): void => { handleStreamFailure(error, attemptAccount) },
+        (error): void => { handleStreamFailure(error, attemptAccount, myGeneration) },
         signal,
         this.config.preferredEndpoint
-      ).catch(error => handleStreamFailure(error as Error, attemptAccount))
+      ).catch(error => handleStreamFailure(error as Error, attemptAccount, myGeneration))
       }
 
       // 首块前失败且仍有重试额度 → 透明换号/退避重试，对客户端完全不可见
-      const handleStreamFailure = (error: Error, failedAccount: { id: string }): void => {
+      const handleStreamFailure = (error: Error, failedAccount: { id: string }, errGeneration: number): void => {
+        // 已被后续尝试取代的迟到失败回调：直接丢弃，不重复重试、不重复记账
+        if (errGeneration !== generation) return
         if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
           resolve()
           return
@@ -3299,12 +3311,19 @@ export class ProxyServer {
       // 当前实际服务的账号（透明重试可能换号，成功统计需归属到真正服务的账号）
       let activeAccount: { id: string; accessToken: string; profileArn?: string } = account
       const triedIds = new Set<string>([account.id])
+      // 当前尝试代号。callKiroApiStream 的 onError 无去重保护，同一次调用可能触发多次
+      // （parseEventStream 内部 catch 调 onError 后，外层端点循环结束还会再调一次）。
+      // 每次尝试持有自己的 generation，只有等于当前值的回调才被受理，
+      // 否则迟到失败会各自触发一次重试，两条上游流并发写同一个 res 导致 SSE 帧交错。
+      let generation = 0
       const startAttempt = (attemptAccount: { id: string; accessToken: string; profileArn?: string }): void => {
         activeAccount = attemptAccount
+        const myGeneration = ++generation
         callKiroApiStream(
         attemptAccount as any,
         kiroPayload,
         (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
+          if (myGeneration !== generation) return
           if (signal?.aborted || this.isResponseClosed(res)) return
           ensurePreamble()
           // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
@@ -3430,6 +3449,7 @@ export class ProxyServer {
           return this.waitForDrain(res)
         },
         async (usage) => {
+          if (myGeneration !== generation) return
           if (signal?.aborted || this.isResponseClosed(res)) {
             resolve()
             return
@@ -3487,14 +3507,16 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error): void => { handleStreamFailure(error, attemptAccount) },
+        (error): void => { handleStreamFailure(error, attemptAccount, myGeneration) },
         signal,
         this.config.preferredEndpoint
-      ).catch(error => handleStreamFailure(error as Error, attemptAccount))
+      ).catch(error => handleStreamFailure(error as Error, attemptAccount, myGeneration))
       }
 
       // 首块前失败且仍有重试额度 → 透明换号/退避重试，对客户端完全不可见
-      const handleStreamFailure = (error: Error, failedAccount: { id: string }): void => {
+      const handleStreamFailure = (error: Error, failedAccount: { id: string }, errGeneration: number): void => {
+        // 已被后续尝试取代的迟到失败回调：直接丢弃，不重复重试、不重复记账
+        if (errGeneration !== generation) return
         if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
           resolve()
           return

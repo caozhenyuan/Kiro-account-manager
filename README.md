@@ -278,6 +278,11 @@ The project is configured with GitHub Actions workflow for auto building all pla
 - **Attribution fix**: after a transparent account switch succeeds, success stats (tokens/credits/request records) are attributed to the account that actually served the request
 - **Verification**: new `test/smoke-retry.mts` smoke test (fake AWS upstream): fetch failed + 500 high load recovers transparently on streaming, persistent 500 returns a real HTTP 500, non-streaming fetch failed retries successfully
 
+#### 🐛 Concurrent-Write and Double-Accounting Hardening for Transparent Retry
+
+- **Attempt generation guard**: `callKiroApiStream`'s `onError` has no dedup guard (`parseEventStream` invokes it once from its internal catch, then the outer endpoint loop invokes it again with `lastError`), so a single call can fire the failure callback twice. Previously each one triggered its own retry, leaving two upstream streams writing to the same `res` with interleaved SSE frames. Each attempt now holds an incrementing generation, and `onChunk`/`onComplete`/`onError` all check it before proceeding
+- **Accounting dedup**: the quota/throttle branch now calls `recordError` only when the failure is actually consumed by an account switch; when it returns null (no account to switch to), accounting is left to `handleApiError`. Previously both recorded, making the circuit breaker's exponential backoff accumulate in double steps and turning transient faults into long cooldowns
+
 ---
 
 ### v1.7.9 (2026-8-28) — Streaming Duplicate-Text/Prefix Hardening + Raw-Stream Diagnostics

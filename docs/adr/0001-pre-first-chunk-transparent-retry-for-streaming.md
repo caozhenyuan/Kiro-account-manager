@@ -21,6 +21,15 @@
    而非 200 + SSE error 事件；首块已发出则维持 SSE error 事件收场（字节已送达，无法重试）。
 4. **非流式补齐**：`callWithRetry` 增加网络瞬时错误与过载关键词匹配（`MODEL_TEMPORARILY_UNAVAILABLE`/high load），
    与既有 5xx 分支同策略。
+5. **尝试代号隔离（generation）**：每次尝试持有自增代号，`onChunk`/`onComplete`/`onError` 三个回调
+   都先比对代号，只受理当前尝试的回调。`callKiroApiStream` 的 `onError` 没有去重保护——
+   `parseEventStream` 内部 catch 调一次 `onError` 后，外层端点循环结束还会用 `lastError` 再调一次——
+   若不隔离，两次失败会各自触发一次重试，两条上游流并发写同一个 `res`，SSE 帧交错。
+
+## 记账归属
+
+配额/限流分支只在「本次失败被换号消化掉」时 `recordError`；返回 null（无号可切）时留给调用方的
+`handleApiError` 统一记账。两处都记会让断路器的指数退避按双倍步进累积，把瞬时故障放大成长时间冷却。
 
 ## 备选方案与取舍
 
