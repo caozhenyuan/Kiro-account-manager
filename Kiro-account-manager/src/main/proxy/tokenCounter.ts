@@ -22,8 +22,31 @@ function getEncoder(): Tiktoken | null {
   }
 }
 
+// js-tiktoken 的 BPE 合并对单个 piece 是超线性复杂度：一段无空白的长连续字符
+// （如 8KB 连续字母/符号）编码就要数秒，40KB 要一个多小时，且同步阻塞主进程事件循环。
+// 超过该长度的连续非空白/空白段不交给 tiktoken，改用字节系数估算。
+const MAX_ENCODE_RUN = 128
+const LONG_RUN_RE = new RegExp(`\\S{${MAX_ENCODE_RUN},}|\\s{${MAX_ENCODE_RUN},}`, 'g')
+
+function estimateByBytes(text: string): number {
+  return Math.ceil(Buffer.byteLength(text, 'utf-8') / 3.0)
+}
+
+function encodeBounded(enc: Tiktoken, text: string): number {
+  let total = 0
+  let last = 0
+  for (const m of text.matchAll(LONG_RUN_RE)) {
+    const start = m.index ?? 0
+    if (start > last) total += enc.encode(text.slice(last, start)).length
+    total += estimateByBytes(m[0])
+    last = start + m[0].length
+  }
+  if (last < text.length) total += enc.encode(text.slice(last)).length
+  return total
+}
+
 /**
- * 使用 tiktoken cl100k_base 精确计算 token 数。
+ * 使用 tiktoken cl100k_base 精确计算 token 数（超长连续段按字节估算）。
  * 兜底：UTF-8 字节数 / 3.0（针对 payload JSON 经验值，误差 ±10%）。
  */
 export function countTokens(text: string): number {
@@ -31,12 +54,12 @@ export function countTokens(text: string): number {
   const enc = getEncoder()
   if (enc) {
     try {
-      return enc.encode(text).length
+      return encodeBounded(enc, text)
     } catch (err) {
       console.warn('[TokenCounter] encode failed, using fallback:', err)
     }
   }
-  return Math.ceil(Buffer.byteLength(text, 'utf-8') / 3.0)
+  return estimateByBytes(text)
 }
 
 // ============ 模型 context 窗口缓存 ============
