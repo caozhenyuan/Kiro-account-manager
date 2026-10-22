@@ -264,6 +264,16 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.12 (2026-10-22) — Fix Large-Context Requests Blocking the Main Process (App Freeze)
+
+#### 🐛 Token Counting Froze the Main Process, Seen as an Unresponsive Proxy / App Crash
+
+- **Symptom**: with large-context sessions (hundreds of history messages, payloads near 1MB) the proxy took 55–154 seconds from receiving a request to sending it upstream (normal median: 0.26s). During that window the whole app logged nothing and the UI and tray were unresponsive, so users assumed a crash and force-restarted
+- **Root cause**: the Prompt Cache simulator counts tokens for every message block with `js-tiktoken`, whose BPE merge is super-linear on a single run without whitespace — measured at ~2.5s for 8KB of consecutive letters/symbols/spaces, ~16s for 20KB, and over an hour for 40KB, all synchronous on the main-process event loop. Long separator lines, minified code, and long whitespace runs are common in Claude Code context, and every turn recounts the full history
+- **Fix**: `countTokens` now estimates runs of ≥128 consecutive non-whitespace/whitespace characters by byte ratio, leaving the rest to exact tiktoken counting. Results for ordinary text are identical to before; 1MB pathological input drops from never finishing to milliseconds
+
+---
+
 ### v1.7.11 (2026-9-23) — Token Lifecycle: Diagnosability, Terminal-State Detection, Cross-Region ARN Fallback
 
 All four fixes came out of investigating one real incident. The incident itself had two parts, and the diagnosis matters: **Kiro made no changes, and the refresh logic did not corrupt any token** — every problem was in the aftermath handling.
