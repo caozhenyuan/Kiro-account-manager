@@ -86,25 +86,25 @@
 ## 📸 截图
 
 ### 主页
-![主页](resources/主页.png)
+![主页](docs/screenshots/主页.png)
 
 ### 账户管理
-![账户管理](resources/账户管理.png)
+![账户管理](docs/screenshots/账户管理.png)
 
 ### 机器码管理
-![机器码管理](resources/机器码管理.png)
+![机器码管理](docs/screenshots/机器码管理.png)
 
 ### 设置
-![设置](resources/设置.png)
+![设置](docs/screenshots/设置.png)
 
 ### Kiro IDE 设置
-![Kiro 设置](resources/Kiro%20设置.png)
+![Kiro 设置](docs/screenshots/Kiro%20设置.png)
 
 ### 主题颜色
-![主题颜色](resources/主题色.png)
+![主题颜色](docs/screenshots/主题色.png)
 
 ### 关于
-![关于](resources/关于.png)
+![关于](docs/screenshots/关于.png)
 
 ---
 

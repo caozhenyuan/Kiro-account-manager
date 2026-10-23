@@ -6,17 +6,26 @@ files:
   - '!**/.vscode/*'
   - '!src/*'
   - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md,README_CN.md,LICENSE}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json,*.tsbuildinfo}'
+  - '!{test,docs,scripts,build,.kiro}/**'
+  # Windows DLL 由 win.extraResources 单独放到安装目录，不进 asar
+  - '!resources/*.dll'
+  # js-tiktoken 只用 lite 入口 + cl100k_base（见 src/main/proxy/tokenCounter.ts）
+  # 主进程按 CJS 构建，运行时只 require lite.cjs 与 ranks/cl100k_base.cjs
+  - '!node_modules/js-tiktoken/dist/{index.cjs,*.js}'
+  - '!node_modules/js-tiktoken/dist/ranks/{gpt2,o200k_base,p50k_base,p50k_edit,r50k_base}.*'
+  - '!node_modules/js-tiktoken/dist/ranks/*.js'
+  # koffi 的源码与 BSD 原生库任何平台都用不上；其余平台原生库由 afterPack 按目标平台清理
+  - '!node_modules/koffi/{src,vendor,doc}/**'
+  - '!node_modules/koffi/build/koffi/{freebsd_*,openbsd_*}/**'
+afterPack: scripts/after-pack.cjs
 asarUnpack:
   - resources/**
   - node_modules/koffi/**
   - node_modules/tlsclientwrapper/**
   - node_modules/piscina/**
-extraResources:
-  - from: "resources/tls-client-xgo-1.14.0-windows-amd64.dll"
-    to: "tls-client-xgo-1.14.0-windows-amd64.dll"
 protocols:
   name: Kiro Auth
   schemes:
@@ -27,6 +36,10 @@ win:
   icon: resources/icon.ico
   legalTrademarks: Copyright 2026 Kiro
   requestedExecutionLevel: asInvoker
+  # registrar.ts 的 ensureTlsLib 从 process.resourcesPath 取这个 DLL；mac/linux 用的是 .dylib/.so，不需要它
+  extraResources:
+    - from: "resources/tls-client-xgo-1.14.0-windows-amd64.dll"
+      to: "tls-client-xgo-1.14.0-windows-amd64.dll"
 nsis:
   artifactName: ${name}-${version}-${arch}-setup.${ext}
   shortcutName: Kiro 账号管理器

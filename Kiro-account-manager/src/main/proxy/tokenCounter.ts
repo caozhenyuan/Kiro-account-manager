@@ -3,7 +3,9 @@
  * 失败时降级到字节系数估算；并提供按模型 ID 查询 context 窗口大小，
  * 以便从 Kiro 后端的 contextUsagePercentage 反推真实 input tokens。
  */
-import { getEncoding, type Tiktoken } from 'js-tiktoken'
+// 只引入 lite 入口 + cl100k_base 编码表；完整入口会带上全部 7 套编码表（约 20MB）
+import { Tiktoken } from 'js-tiktoken/lite'
+import cl100k_base from 'js-tiktoken/ranks/cl100k_base'
 
 let encoder: Tiktoken | null = null
 let encoderInitFailed = false
@@ -13,7 +15,7 @@ function getEncoder(): Tiktoken | null {
   if (encoder) return encoder
   if (encoderInitFailed) return null
   try {
-    encoder = getEncoding('cl100k_base')
+    encoder = new Tiktoken(cl100k_base)
     return encoder
   } catch (err) {
     console.warn('[TokenCounter] Failed to load cl100k_base encoder:', err)

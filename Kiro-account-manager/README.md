@@ -86,25 +86,25 @@
 ## 📸 Screenshots
 
 ### Home
-![Home](resources/主页.png)
+![Home](docs/screenshots/主页.png)
 
 ### Account Management
-![Account Management](resources/账户管理.png)
+![Account Management](docs/screenshots/账户管理.png)
 
 ### Machine ID Management
-![Machine ID Management](resources/机器码管理.png)
+![Machine ID Management](docs/screenshots/机器码管理.png)
 
 ### Settings
-![Settings](resources/设置.png)
+![Settings](docs/screenshots/设置.png)
 
 ### Kiro IDE Settings
-![Kiro Settings](resources/Kiro%20设置.png)
+![Kiro Settings](docs/screenshots/Kiro%20设置.png)
 
 ### Theme Colors
-![Theme Colors](resources/主题色.png)
+![Theme Colors](docs/screenshots/主题色.png)
 
 ### About
-![About](resources/关于.png)
+![About](docs/screenshots/关于.png)
 
 ---
 

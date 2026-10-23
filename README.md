@@ -67,37 +67,37 @@
 ### Home
 Shows account statistics, current account details, subscription info and quota breakdown.
 
-![Home](Kiro-account-manager/resources/主页.png)
+![Home](Kiro-account-manager/docs/screenshots/主页.png)
 
 ### Account Management
 Manage all accounts, search, filter, batch operations, one-click switch.
 
-![Account Management](Kiro-account-manager/resources/账户管理.png)
+![Account Management](Kiro-account-manager/docs/screenshots/账户管理.png)
 
 ### Machine ID Management
 Manage device identifier, prevent account association bans, backup and restore.
 
-![Machine ID Management](Kiro-account-manager/resources/机器码管理.png)
+![Machine ID Management](Kiro-account-manager/docs/screenshots/机器码管理.png)
 
 ### Settings
 Configure theme colors, privacy mode, auto refresh, proxy and more.
 
-![Settings](Kiro-account-manager/resources/设置.png)
+![Settings](Kiro-account-manager/docs/screenshots/设置.png)
 
 ### API Proxy Service
 Provides OpenAI and Claude compatible API endpoints with multi-account rotation, auto token refresh, request retry and more.
 
-![API Proxy Service](Kiro-account-manager/resources/API%20反代服务.png)
+![API Proxy Service](Kiro-account-manager/docs/screenshots/API%20反代服务.png)
 
 ### Kiro IDE Settings
 Sync Kiro IDE settings, edit MCP servers, manage user rules (Steering).
 
-![Kiro Settings](Kiro-account-manager/resources/Kiro%20设置.png)
+![Kiro Settings](Kiro-account-manager/docs/screenshots/Kiro%20设置.png)
 
 ### About
 View version info, feature list, tech stack and author info.
 
-![About](Kiro-account-manager/resources/关于.png)
+![About](Kiro-account-manager/docs/screenshots/关于.png)
 
 ---
 
