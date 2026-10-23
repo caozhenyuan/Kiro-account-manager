@@ -5,6 +5,28 @@
 import { createHash } from 'crypto'
 import { estimateTokens } from './kiroApi'
 
+// 块 token 数缓存：会话历史只追加，每轮请求重复计数的都是同一批块，tiktoken 计数占本模块耗时约九成。
+// key 用文本的 SHA-1（不长期持有大段原文），LRU 上限覆盖几个并行的大会话。
+const TOKEN_CACHE_MAX = 5000
+const blockTokenCache = new Map<string, number>()
+
+function cachedTokens(text: string): number {
+  if (text.length < 256) return estimateTokens(text)
+  const key = createHash('sha1').update(text).digest('base64')
+  const hit = blockTokenCache.get(key)
+  if (hit !== undefined) {
+    blockTokenCache.delete(key)
+    blockTokenCache.set(key, hit)
+    return hit
+  }
+  const tokens = estimateTokens(text)
+  blockTokenCache.set(key, tokens)
+  if (blockTokenCache.size > TOKEN_CACHE_MAX) {
+    blockTokenCache.delete(blockTokenCache.keys().next().value as string)
+  }
+  return tokens
+}
+
 // 常量
 const DEFAULT_CACHE_TTL = 5 * 60 * 1000       // 5 分钟（Anthropic 默认 ephemeral TTL）
 const ONE_HOUR_CACHE_TTL = 60 * 60 * 1000     // 1 小时
@@ -215,7 +237,7 @@ export class PromptCacheTracker {
         const value = this.canonicalize({ kind: 'tool', name: tool.name, description: tool.description, input_schema: tool.input_schema })
         blocks.push({
           value,
-          tokens: estimateTokens(value),
+          tokens: cachedTokens(value),
           ttl: this.extractTTL(tool),
           isMessageEnd: false
         })
@@ -237,7 +259,7 @@ export class PromptCacheTracker {
     if (!system) return
     if (typeof system === 'string') {
       const value = this.canonicalize({ kind: 'system', type: 'text', text: system })
-      blocks.push({ value, tokens: estimateTokens(system), ttl: 0, isMessageEnd: false })
+      blocks.push({ value, tokens: cachedTokens(system), ttl: 0, isMessageEnd: false })
     } else if (Array.isArray(system)) {
       for (const block of system) {
         const obj = typeof block === 'string' ? { type: 'text', text: block } : block
@@ -245,7 +267,7 @@ export class PromptCacheTracker {
         const text = (obj as Record<string, unknown>).text as string || ''
         blocks.push({
           value,
-          tokens: estimateTokens(text || JSON.stringify(obj)),
+          tokens: cachedTokens(text || JSON.stringify(obj)),
           ttl: this.extractTTL(obj),
           isMessageEnd: false
         })
@@ -263,7 +285,7 @@ export class PromptCacheTracker {
       const value = this.canonicalize({ kind: 'message', role: msg.role, index: messageIndex, type: 'text', text: content })
       blocks.push({
         value,
-        tokens: estimateTokens(content),
+        tokens: cachedTokens(content),
         ttl: this.extractTTL(msg),
         isMessageEnd: true
       })
@@ -275,7 +297,7 @@ export class PromptCacheTracker {
         const value = this.canonicalize({ kind: 'message', role: msg.role, index: messageIndex, blockIndex: i, block })
         blocks.push({
           value,
-          tokens: estimateTokens(text || JSON.stringify(block)),
+          tokens: cachedTokens(text || JSON.stringify(block)),
           ttl: this.extractTTL(block),
           isMessageEnd: i === lastIdx
         })

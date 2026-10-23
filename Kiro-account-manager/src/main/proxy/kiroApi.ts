@@ -1535,12 +1535,11 @@ async function parseEventStream(
   let reasoningChars = 0
   const reqCtx = getRequestContext()
 
-  // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
-  // 这里只是兜底初值，后续真实事件会覆盖
-  if (payloadStr) {
-    // 用 tiktoken cl100k_base 精确计算（±5%）
-    usage.inputTokens = countTokens(payloadStr)
-  } else if (inputChars > 0) {
+  // input tokens 优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数
+  // tiktoken 兜底推迟到流结束且上游未给出用量时才算：整个 payload 计数要同步阻塞数百毫秒，
+  // 而上游几乎总会发 contextUsageEvent 覆盖它
+  let inputFromContext = false
+  if (!payloadStr && inputChars > 0) {
     // 字符系数兜底（针对 payload JSON 经验值 0.42）
     usage.inputTokens = Math.max(1, Math.round(inputChars * 0.42))
   }
@@ -1976,7 +1975,8 @@ async function parseEventStream(
                 if (tokenUsage.outputTokens) usage.outputTokens = tokenUsage.outputTokens
                 if (tokenUsage.totalTokens) {
                   // 如果有 totalTokens，用它来推算
-                  if (usage.inputTokens === 0 && usage.outputTokens > 0) {
+                  // 有 payloadStr 时 input 由 tiktoken 兜底，不走 totalTokens 推算
+                  if (usage.inputTokens === 0 && !payloadStr && usage.outputTokens > 0) {
                     usage.inputTokens = tokenUsage.totalTokens - usage.outputTokens
                     hasRealTokenUsage = true
                   }
@@ -2077,6 +2077,7 @@ async function parseEventStream(
                   const reverseInput = Math.round(contextLen * percentage / 100)
                   if (reverseInput > 0) {
                     usage.inputTokens = reverseInput
+                    inputFromContext = true
                     proxyLogger.info('Kiro', `contextUsageEvent ${percentage.toFixed(2)}% → inputTokens=${reverseInput} (modelContext=${contextLen}, model=${modelId || 'unknown'})`)
                   } else {
                     proxyLogger.info('Kiro', `contextUsageEvent - Context usage: ${percentage.toFixed(2)}%`)
@@ -2259,6 +2260,10 @@ async function parseEventStream(
       if (rescued > 0 || toolLeakDebug) {
         proxyLogger.info('Kiro', `Tool-leak-fix: leaked=${leakedTools.length} rescued=${rescued} deduped=${deduped}`)
       }
+    }
+
+    if (payloadStr && !hasRealTokenUsage && !inputFromContext) {
+      usage.inputTokens = countTokens(payloadStr)
     }
 
     // 如果 API 没有返回 token 信息，优先用 tiktoken 精确计算，兜底字符系数

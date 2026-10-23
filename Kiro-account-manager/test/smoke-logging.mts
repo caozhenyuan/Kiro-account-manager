@@ -55,7 +55,7 @@ function streamResponse(frames: Uint8Array[], gapMs: number): Response {
 
 const REASONING_CHUNKS = 30
 
-type Script = 'normal' | 'thinking' | 'failover'
+type Script = 'normal' | 'thinking' | 'failover' | 'context'
 let script: Script = 'normal'
 let upstreamCalls = 0
 const originalFetch = globalThis.fetch
@@ -71,6 +71,15 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
   }
   upstreamCalls++
   if (script === 'failover' && upstreamCalls === 1) throw new TypeError('fetch failed')
+  if (script === 'context') {
+    return streamResponse(
+      [
+        frame('assistantResponseEvent', { assistantResponseEvent: { content: '好' } }),
+        frame('contextUsageEvent', { contextUsageEvent: { contextUsagePercentage: 12.5 } })
+      ],
+      1
+    )
+  }
   if (script === 'thinking') {
     const frames: Uint8Array[] = []
     for (let i = 0; i < REASONING_CHUNKS; i++) {
@@ -271,6 +280,33 @@ async function main(): Promise<void> {
       '端点失败 ERROR 日志带同一 reqId',
       errs.length > 0 && errs.every((l) => l.reqId === done[0]?.reqId)
     )
+  }
+
+  // input tokens 兜底链路：tiktoken 推迟到流结束，上游给了 contextUsage 时不再计算
+  const inputTokensOf = (from: number): number | undefined =>
+    (
+      logs.slice(from).find((l) => l.message === 'Stream complete, final usage')?.data as
+        | { inputTokens?: number }
+        | undefined
+    )?.inputTokens
+  {
+    console.log('[smoke] 场景 D：上游未返回用量 → tiktoken 兜底 input tokens')
+    script = 'normal'
+    const from = logs.length
+    await post(body('CLAUDE_OPUS_5_TEST'))
+    await settle()
+    const input = inputTokensOf(from)
+    check('input tokens 由 tiktoken 计出（> 0）', (input ?? 0) > 0, `inputTokens=${input}`)
+  }
+  {
+    console.log('[smoke] 场景 E：上游返回 contextUsage → 采用反推值')
+    script = 'context'
+    const from = logs.length
+    await post(body('CLAUDE_OPUS_5_TEST'))
+    await settle()
+    const input = inputTokensOf(from)
+    // 未知模型按 200K 上下文反推：200000 × 12.5% = 25000
+    check('input tokens = contextUsage 反推值', input === 25000, `inputTokens=${input}`)
   }
 
   await server.stop()
