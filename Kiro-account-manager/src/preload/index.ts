@@ -29,6 +29,13 @@ const api = {
     return ipcRenderer.invoke('load-accounts')
   },
 
+  // 账号管理 - 用量历史快照（按天、按账号）
+  getUsageHistory: (): Promise<
+    Record<string, Record<string, { c: number; l: number; t?: string; r?: string }>>
+  > => {
+    return ipcRenderer.invoke('get-usage-history')
+  },
+
   // 账号管理 - 保存账号数据
   saveAccounts: (data: unknown): Promise<void> => {
     return ipcRenderer.invoke('save-accounts', data)

@@ -6,6 +6,7 @@ import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, AccountFilter } from '@/types/account'
+import { MonthlyUsageDashboard } from './MonthlyUsageDashboard'
 
 // 额度告急阈值（usage.percentUsed 为 0-1 小数）
 const QUOTA_WARN_RATIO = 0.9
@@ -366,6 +367,9 @@ export function HomePage() {
           </CardContent>
         </Card>
       )}
+
+      {/* 月度额度分析：总额度/已用/剩余/日均/月底预测 + 每日趋势 + 订阅分布 */}
+      <MonthlyUsageDashboard accounts={accounts} isEn={isEn} precision={usagePrecision ? 2 : 1} />
 
       {/* Current Account */}
       {activeAccount && (

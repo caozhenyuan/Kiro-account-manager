@@ -28,6 +28,7 @@ import {
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole, getRequestContext } from './proxy/logger'
+import { UsageHistoryStore } from './usageHistory'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -1449,6 +1450,13 @@ let store: {
 
 // 最后保存的数据（用于崩溃恢复）
 let lastSavedData: unknown = null
+
+// 用量历史快照（首页月度额度分析的每日趋势数据源），延迟到 app ready 后才能取 userData 路径
+let usageHistoryStore: UsageHistoryStore | null = null
+function getUsageHistoryStore(): UsageHistoryStore {
+  if (!usageHistoryStore) usageHistoryStore = new UsageHistoryStore(app.getPath('userData'))
+  return usageHistoryStore
+}
 
 async function initStore(): Promise<void> {
   if (store) return
@@ -3112,6 +3120,16 @@ app.whenReady().then(async () => {
     }
   })
 
+  // IPC: 读取用量历史快照
+  ipcMain.handle('get-usage-history', async () => {
+    try {
+      return await getUsageHistoryStore().get()
+    } catch (error) {
+      console.error('[UsageHistory] load failed:', error)
+      return {}
+    }
+  })
+
   // IPC: 加载账号数据
   ipcMain.handle('load-accounts', async () => {
     try {
@@ -3131,6 +3149,11 @@ app.whenReady().then(async () => {
       
       // 保存最后的数据（用于崩溃恢复）
       lastSavedData = data
+
+      // 记录当天用量快照；失败不影响账号保存
+      void getUsageHistoryStore()
+        .record(data)
+        .catch((err) => console.warn('[UsageHistory] record failed:', err))
 
       // 解除 needs-relogin 终态：用户重新登录后 refreshToken 会变，
       // 此时必须放开主池调度，否则新凭证也不会被刷新（内存标记按账号 ID 记，
@@ -7569,6 +7592,11 @@ app.on('will-quit', async (event) => {
       // 退出场景跳过节流，确保备份立即落盘
       await createBackup(lastSavedData)
       await flushBackupNow()
+      try {
+        await getUsageHistoryStore().flush()
+      } catch (err) {
+        console.error('[Exit] Failed to flush usage history:', err)
+      }
       // 强制落盘代理日志（异步节流中的尾巴数据）
       try {
         const { proxyLogStore } = await import('./proxy/logger')
