@@ -264,6 +264,17 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.14 (2026-10-23) — Faster Local Preprocessing (Token-Count Cache)
+
+#### ⚡ Local Preprocessing for Large-Context Sessions Drops from Hundreds of ms to Single Digits
+
+- **Symptom**: across 21 requests measured with the `Request done` summary added in v1.7.13, local proxy preprocessing (`local=`) had a 0.52s median, ~88% of which was re-running tiktoken over every message block. It runs synchronously and blocks the main process, so concurrent requests queue behind it
+- **Block-level cache**: session history is append-only, so each turn recounts the same blocks. `promptCacheTracker` now caches token counts keyed by the SHA-1 of the block text (LRU, 5000 entries), so later turns only count newly added blocks. On a simulated 300-message session (~500KB), turn 2 goes from 332ms to 8ms, with breakpoints and token totals identical to before
+- **Whole-payload count deferred**: every request used to run tiktoken over the entire payload (~260ms per 500KB) before being sent, but that value is only a placeholder that the upstream's `contextUsageEvent` almost always overwrites. It is now computed at stream end, and only when the upstream returned no usage figure. The input-token priority chain is unchanged: `tokenUsage` > `contextUsage` reverse calculation > tiktoken > character-ratio estimate
+- **Expected gain**: about 0.4–0.5s saved per request (~3% of total latency); the main benefit is that the main process no longer freezes for half a second before every request. Upstream time-to-first-byte (~92% of total) depends on context size and is not addressed in this release
+
+---
+
 ### v1.7.13 (2026-10-23) — Log Overhaul (Request IDs / Timing Summaries / Less Noise) + Smaller Installer
 
 #### ✨ Logs Traceable per Request
