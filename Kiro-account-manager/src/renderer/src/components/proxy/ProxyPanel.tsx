@@ -103,7 +103,7 @@ interface ProxyConfig {
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
-type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }
+type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; reqId?: string }
 let _proxyRecentLogs: RecentLogEntry[] = []
 let _refSetProxyRecentLogs: ((v: RecentLogEntry[]) => void) | null = null
 let _proxyResponseListenerRegistered = false
@@ -132,7 +132,8 @@ function ensureProxyResponseListenerRegistered(): void {
       reasoningTokens: info.reasoningTokens,
       credits: info.credits,
       responseTime: info.responseTime,
-      error: info.error
+      error: info.error,
+      reqId: info.reqId
     }, ..._proxyRecentLogs.slice(0, 99)]
     _refSetProxyRecentLogs?.(_proxyRecentLogs)
   })
@@ -163,6 +164,8 @@ export function ProxyPanel() {
   const [refreshSuccess, setRefreshSuccess] = useState(false)
   const [showLogsDialog, setShowLogsDialog] = useState(false)
   const [showDetailedLogsDialog, setShowDetailedLogsDialog] = useState(false)
+  // 从请求日志跳转到详细日志时，预设的请求 ID 过滤
+  const [detailedLogsReqId, setDetailedLogsReqId] = useState<string | null>(null)
   const [showModelsDialog, setShowModelsDialog] = useState(false)
   const [showClientConfigDialog, setShowClientConfigDialog] = useState(false)
   const [showModelMappingDialog, setShowModelMappingDialog] = useState(false)
@@ -1471,13 +1474,22 @@ export function ProxyPanel() {
           await window.api.proxyResetTokens()
           fetchStatus()
         }}
+        onViewRequestLogs={(reqId) => {
+          setShowLogsDialog(false)
+          setDetailedLogsReqId(reqId)
+          setShowDetailedLogsDialog(true)
+        }}
         isEn={isEn}
       />
 
       {/* 详细日志弹窗 */}
       <ProxyDetailedLogsDialog
         open={showDetailedLogsDialog}
-        onOpenChange={setShowDetailedLogsDialog}
+        onOpenChange={(open) => {
+          setShowDetailedLogsDialog(open)
+          if (!open) setDetailedLogsReqId(null)
+        }}
+        initialReqId={detailedLogsReqId}
       />
 
       {/* 模型列表弹窗 */}

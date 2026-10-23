@@ -27,7 +27,7 @@ import {
 } from './kiroAuthSync'
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
-import { proxyLogStore, interceptConsole } from './proxy/logger'
+import { proxyLogStore, interceptConsole, getRequestContext } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -357,7 +357,8 @@ function initProxyServer(): ProxyServer {
         mainWindow?.webContents.send('proxy-request', info)
       },
       onResponse: (info) => {
-        mainWindow?.webContents.send('proxy-response', info)
+        // 回调在请求处理链路内触发，带上 reqId 供请求日志跳转到对应的详细日志
+        mainWindow?.webContents.send('proxy-response', { ...info, reqId: getRequestContext()?.reqId })
       },
       onError: (error) => {
         console.error('[ProxyServer] Error:', error)
@@ -2563,6 +2564,38 @@ function handleProtocolUrl(url: string): void {
   }
 }
 
+// 进程异常与退出原因写入系统日志：否则崩溃和用户强制退出在日志里无法区分
+function registerProcessLifecycleLogging(): void {
+  process.on('uncaughtExceptionMonitor', (error, origin) => {
+    console.error(`[App] Uncaught exception (${origin}):`, error)
+    proxyLogStore.flushSaveNowSync()
+  })
+  process.on('unhandledRejection', (reason) => {
+    console.error('[App] Unhandled rejection:', reason)
+  })
+  app.on('render-process-gone', (_event, webContents, details) => {
+    const url = webContents.getURL().slice(0, 100)
+    console.error(
+      `[App] Renderer process gone: reason=${details.reason} exitCode=${details.exitCode} url=${url}`
+    )
+    proxyLogStore.flushSaveNowSync()
+  })
+  app.on('child-process-gone', (_event, details) => {
+    if (details.reason === 'clean-exit') return
+    const name = details.name ? ` name=${details.name}` : ''
+    console.error(
+      `[App] Child process gone: type=${details.type} reason=${details.reason} exitCode=${details.exitCode}${name}`
+    )
+  })
+  app.on('before-quit', () => {
+    console.log('[App] Quit requested')
+  })
+  process.on('exit', (code) => {
+    console.log(`[App] Process exit (code=${code})`)
+    proxyLogStore.flushSaveNowSync()
+  })
+}
+
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
@@ -2570,6 +2603,9 @@ app.whenReady().then(async () => {
   // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
+  const runtime = `electron ${process.versions.electron}, node ${process.versions.node}`
+  console.log(`[App] Started v${app.getVersion()} (${process.platform}-${process.arch}, ${runtime})`)
+  registerProcessLifecycleLogging()
 
   // 启动 Kiro IDE token 文件监听（反向同步：IDE 自己 refresh 后把新 token 同步回反代 store）
   // 见 syncIdeTokenChangeToStore 注释

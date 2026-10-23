@@ -10,6 +10,7 @@ interface LogEntry {
   category: string
   message: string
   data?: unknown
+  reqId?: string
 }
 
 type LogLevel = 'ALL' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
@@ -51,6 +52,8 @@ export function LogsPage() {
   const [filter, setFilter] = useState('')
   const [levelFilter, setLevelFilter] = useState<LogLevel>('ALL')
   const [categoryFilter, setCategoryFilter] = useState('all')
+  // 点击日志行上的请求 ID 后只看该请求的全部日志
+  const [reqIdFilter, setReqIdFilter] = useState<string | null>(null)
   const [timeRange, setTimeRange] = useState('all')
   // 显示数量默认 5K，用户改动后持久化到 localStorage（页面切换/重启后保留）
   const [displayLimit, setDisplayLimit] = useState<string>(() => {
@@ -132,7 +135,8 @@ export function LogsPage() {
   const handleExport = () => {
     const content = filteredLogs.map(log => {
       const dataStr = log.data ? ` ${typeof log.data === 'string' ? log.data : JSON.stringify(log.data)}` : ''
-      return `${log.timestamp} [${log.level}][${log.category}] ${log.message}${dataStr}`
+      const reqStr = log.reqId ? `[#${log.reqId}]` : ''
+      return `${log.timestamp} [${log.level}][${log.category}]${reqStr} ${log.message}${dataStr}`
     }).join('\n')
     const blob = new Blob([content], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
@@ -153,9 +157,11 @@ export function LogsPage() {
       if (rangeMs > 0 && now - new Date(log.timestamp).getTime() > rangeMs) return false
       if (levelFilter !== 'ALL' && log.level !== levelFilter) return false
       if (categoryFilter !== 'all' && log.category !== categoryFilter) return false
+      if (reqIdFilter && log.reqId !== reqIdFilter) return false
       if (lower) {
         return log.message.toLowerCase().includes(lower) ||
           log.category.toLowerCase().includes(lower) ||
+          (log.reqId !== undefined && log.reqId.includes(lower)) ||
           (typeof log.data === 'string' && log.data.toLowerCase().includes(lower))
       }
       return true
@@ -165,7 +171,7 @@ export function LogsPage() {
       if (limit > 0) result = result.slice(-limit)
     }
     return result
-  }, [logs, levelFilter, categoryFilter, timeRange, displayLimit, filter])
+  }, [logs, levelFilter, categoryFilter, reqIdFilter, timeRange, displayLimit, filter])
 
   const levelCounts = {
     ALL: logs.length,
@@ -247,6 +253,19 @@ export function LogsPage() {
           {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
         </select>
 
+        {/* 请求 ID 过滤（点击日志行上的 #id 设置） */}
+        {reqIdFilter && (
+          <button
+            className="h-7 flex items-center gap-1 px-2 text-[10px] font-mono rounded-md bg-primary/15 text-primary hover:bg-primary/25"
+            onClick={() => setReqIdFilter(null)}
+            title={isEn ? 'Clear request filter' : '清除请求过滤'}
+            aria-label={`${isEn ? 'Clear request filter' : '清除请求过滤'} #${reqIdFilter}`}
+          >
+            #{reqIdFilter}
+            <X className="h-3 w-3" />
+          </button>
+        )}
+
         {/* 显示条数 */}
         <select
           className="h-7 px-2 text-[10px] rounded-md border border-border bg-muted/30 text-foreground cursor-pointer focus:outline-none focus:ring-1 focus:ring-ring"
@@ -296,6 +315,11 @@ export function LogsPage() {
             onScroll={handleScroll}
             isAtBottom={isAtBottom}
             formatTime={formatTime}
+            onSelectReqId={(id) => {
+              setReqIdFilter(id)
+              setExpandedIdx(null)
+            }}
+            reqIdTitle={isEn ? 'Show only this request' : '只看该请求'}
           />
         )}
 
@@ -333,7 +357,7 @@ export function LogsPage() {
 
 // 虚拟滚动日志列表 — 只渲染可视区域内的行
 function VirtualLogList({
-  logs, expandedIdx, onToggleExpand, containerRef, onScroll, isAtBottom, formatTime
+  logs, expandedIdx, onToggleExpand, containerRef, onScroll, isAtBottom, formatTime, onSelectReqId, reqIdTitle
 }: {
   logs: LogEntry[]
   expandedIdx: number | null
@@ -342,6 +366,8 @@ function VirtualLogList({
   onScroll: () => void
   isAtBottom: boolean
   formatTime: (ts: string) => string
+  onSelectReqId: (reqId: string) => void
+  reqIdTitle: string
 }) {
   const virtualizer = useVirtualizer({
     count: logs.length,
@@ -390,6 +416,18 @@ function VirtualLogList({
                   'bg-muted/60 text-muted-foreground'
                 }`}>{log.category}</span>
                 <div className="min-w-0 pl-2">
+                  {log.reqId && (
+                    <button
+                      className="mr-1.5 text-[9px] font-mono text-primary/70 hover:text-primary hover:underline"
+                      title={reqIdTitle}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onSelectReqId(log.reqId!)
+                      }}
+                    >
+                      #{log.reqId}
+                    </button>
+                  )}
                   <span className={`${LEVEL_COLORS[log.level]} break-all`}>{log.message}</span>
                   {log.data !== undefined && log.data !== null && (
                     <Icon className={`inline-block ml-1 h-3 w-3 opacity-30 group-hover:opacity-60 ${LEVEL_COLORS[log.level]}`} />

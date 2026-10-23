@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { X, Trash2, Download, AlertCircle, RotateCcw } from 'lucide-react'
+import { X, Trash2, Download, AlertCircle, RotateCcw, FileSearch } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Badge } from '../ui'
 
 interface LogEntry {
@@ -15,6 +15,7 @@ interface LogEntry {
   credits?: number
   responseTime?: number
   error?: string
+  reqId?: string
 }
 
 interface ProxyLogsDialogProps {
@@ -26,6 +27,8 @@ interface ProxyLogsDialogProps {
   onClearLogs: () => void
   onResetCredits?: () => void
   onResetTokens?: () => void
+  /** 打开详细日志并只显示该请求的日志 */
+  onViewRequestLogs?: (reqId: string) => void
   isEn: boolean
 }
 
@@ -38,6 +41,7 @@ export function ProxyLogsDialog({
   onClearLogs,
   onResetCredits,
   onResetTokens,
+  onViewRequestLogs,
   isEn
 }: ProxyLogsDialogProps) {
   const [expandedError, setExpandedError] = useState<number | null>(null)
@@ -45,8 +49,8 @@ export function ProxyLogsDialog({
   if (!open) return null
 
   const handleExport = () => {
-    const content = logs.map(log => 
-      `${log.time}\t${log.path}\t${log.status}${log.credits ? `\t${log.credits.toFixed(6)} credits` : ''}`
+    const content = logs.map(log =>
+      `${log.time}\t${log.reqId ? `#${log.reqId}\t` : ''}${log.path}\t${log.status}${log.credits ? `\t${log.credits.toFixed(6)} credits` : ''}`
     ).join('\n')
     const blob = new Blob([content], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
@@ -128,6 +132,7 @@ export function ProxyLogsDialog({
                     <th className="text-center p-2 font-medium">Cache</th>
                     <th className="text-right p-2 font-medium">Credits</th>
                     <th className="text-right p-2 font-medium">{isEn ? 'Time' : '耗时'}</th>
+                    {onViewRequestLogs && <th className="p-2" aria-label={isEn ? 'Logs' : '日志'} />}
                   </tr>
                 </thead>
                 <tbody className="font-mono">
@@ -170,6 +175,22 @@ export function ProxyLogsDialog({
                       <td className="p-2 text-center text-success">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.credits ? log.credits.toFixed(6) : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</td>
+                      {onViewRequestLogs && (
+                        <td className="p-2 text-center">
+                          {log.reqId && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-6 w-6"
+                              onClick={() => onViewRequestLogs(log.reqId!)}
+                              title={isEn ? `View logs of request #${log.reqId}` : `查看请求 #${log.reqId} 的详细日志`}
+                              aria-label={isEn ? `View logs of request #${log.reqId}` : `查看请求 #${log.reqId} 的详细日志`}
+                            >
+                              <FileSearch className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>

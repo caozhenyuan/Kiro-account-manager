@@ -19,7 +19,7 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
-import { proxyLogger } from './logger'
+import { proxyLogger, runWithRequestContext, getRequestContext, setRequestModel } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -403,8 +403,11 @@ export class ProxyServer {
 
     return new Promise((resolve, reject) => {
       this.isStopping = false
-      const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => 
-        this.handleRequest(req, res)
+      const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> =>
+        runWithRequestContext(
+          { reqId: crypto.randomBytes(3).toString('hex'), startedAt: Date.now(), endpoints: [] },
+          () => this.handleRequest(req, res)
+        )
 
       // 检查是否启用 TLS
       if (this.config.tls?.enabled) {
@@ -2033,7 +2036,48 @@ export class ProxyServer {
       req.off('aborted', abortRequest)
       res.off('close', abortRequest)
       this.activeRequests.delete(controller)
+      this.logRequestSummary(method, path, res, controller.signal)
     }
+  }
+
+  /** 模型请求结束时输出一条汇总：状态、总耗时与各阶段耗时、尝试过的端点 */
+  private logRequestSummary(
+    method: string,
+    path: string,
+    res: http.ServerResponse,
+    signal: AbortSignal
+  ): void {
+    const ctx = getRequestContext()
+    if (!ctx?.model) return
+    const end = Date.now()
+    const ms = (from?: number, to?: number): number | undefined =>
+      from !== undefined && to !== undefined ? to - from : undefined
+    const aborted = signal.aborted && !res.writableFinished
+    const local = ms(ctx.startedAt, ctx.upstreamStartAt)
+    const ttfb = ms(ctx.attemptStartAt, ctx.firstChunkAt)
+    const parts = [
+      aborted ? 'aborted' : String(res.statusCode),
+      `total=${end - ctx.startedAt}ms`,
+      local !== undefined ? `local=${local}ms` : undefined,
+      ttfb !== undefined ? `ttfb=${ttfb}ms` : undefined,
+      ctx.endpoints.length > 0 ? `via=${ctx.endpoints.join('→')}` : undefined
+    ].filter(Boolean)
+    const data = {
+      method,
+      path: path.split('?')[0],
+      model: ctx.model,
+      status: res.statusCode,
+      aborted,
+      totalMs: end - ctx.startedAt,
+      localMs: local,
+      upstreamHeadersMs: ms(ctx.attemptStartAt, ctx.upstreamHeadersAt),
+      firstChunkMs: ttfb,
+      streamMs: ms(ctx.firstChunkAt, end),
+      endpoints: ctx.endpoints
+    }
+    const message = `Request done: ${ctx.model} ${parts.join(' ')}`
+    if (aborted || res.statusCode >= 500) proxyLogger.warn('ProxyServer', message, data)
+    else proxyLogger.info('ProxyServer', message, data)
   }
 
   // 管理 API 端点
@@ -2618,6 +2662,7 @@ export class ProxyServer {
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
+    setRequestModel(request.model)
 
     const startTime = Date.now()
 
@@ -2747,6 +2792,7 @@ export class ProxyServer {
         affinityHintResp = `${keyPrefix}:${rawHintResp}`
       }
       chatRequest.model = this.applyModelMapping(chatRequest.model, matchedApiKey?.id)
+      setRequestModel(chatRequest.model)
       processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(chatRequest), signal)
     } catch (error) {
       if (this.isAbortError(error, signal)) return
@@ -3110,6 +3156,7 @@ export class ProxyServer {
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
+    setRequestModel(request.model)
 
     const startTime = Date.now()
 

@@ -15,7 +15,7 @@ import type {
   KiroUsage,
   ProxyAccount
 } from './types'
-import { proxyLogger } from './logger'
+import { proxyLogger, getRequestContext } from './logger'
 import { getKProxyService } from '../kproxy'
 import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
 import {
@@ -1311,22 +1311,38 @@ export async function callKiroApiStream(
       const historyMessages = requestPayload.conversationState.history ?? []
       const historyToolUseCount = historyMessages.reduce((count, message) => count + (message.assistantResponseMessage?.toolUses?.length ?? 0), 0)
       const historyToolResultCount = historyMessages.reduce((count, message) => count + (message.userInputMessage?.userInputMessageContext?.toolResults?.length ?? 0), 0)
-      console.log(`[KiroAPI] Request to ${endpoint.name}:`)
-      console.log(`[KiroAPI]   - Content length: ${currentUserInput?.content?.length || 0}`)
-      console.log(`[KiroAPI]   - Tools count: ${currentUserInput?.userInputMessageContext?.tools?.length || 0}`)
-      console.log(`[KiroAPI]   - Current tool results: ${currentUserInput?.userInputMessageContext?.toolResults?.length || 0}`)
-      console.log(`[KiroAPI]   - History messages: ${historyMessages.length}`)
-      console.log(`[KiroAPI]   - History tool uses/results: ${historyToolUseCount}/${historyToolResultCount}`)
-      console.log(`[KiroAPI]   - Model ID: ${currentUserInput?.modelId || 'default'}`)
-      console.log(`[KiroAPI]   - Has profileArn: ${requestPayload.profileArn !== undefined}`)
-      console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
-      console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
-      
+      const modelIdForLog = currentUserInput?.modelId || 'default'
+      const requestSummary = `model=${modelIdForLog} history=${historyMessages.length} payload=${payloadStr.length}B`
+      const userContext = currentUserInput?.userInputMessageContext
+      proxyLogger.info('KiroAPI', `Request to ${endpoint.name}: ${requestSummary}`, {
+        contentLength: currentUserInput?.content?.length || 0,
+        toolsCount: userContext?.tools?.length || 0,
+        currentToolResults: userContext?.toolResults?.length || 0,
+        historyMessages: historyMessages.length,
+        historyToolUses: historyToolUseCount,
+        historyToolResults: historyToolResultCount,
+        modelId: modelIdForLog,
+        hasProfileArn: requestPayload.profileArn !== undefined,
+        agentMode: headers['x-amzn-kiro-agent-mode'],
+        payloadSize: payloadStr.length
+      })
+
+      const reqCtx = getRequestContext()
+      if (reqCtx) {
+        const now = Date.now()
+        reqCtx.upstreamStartAt ??= now
+        reqCtx.attemptStartAt = now
+        reqCtx.upstreamHeadersAt = undefined
+        reqCtx.firstChunkAt = undefined
+        reqCtx.endpoints.push(endpoint.name)
+      }
+
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
       const response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+      if (reqCtx) reqCtx.upstreamHeadersAt = Date.now()
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
@@ -1393,6 +1409,13 @@ export async function callKiroApiStream(
             applyPayloadModelId(retryPayload, await resolveCodeWhispererModelId(account, getPayloadModelId(retryPayload), signal))
           }
           applyPayloadOrigin(retryPayload, endpoint.origin)
+          const retryCtx = getRequestContext()
+          if (retryCtx) {
+            retryCtx.attemptStartAt = Date.now()
+            retryCtx.upstreamHeadersAt = undefined
+            retryCtx.firstChunkAt = undefined
+            retryCtx.endpoints.push(`${endpoint.name}(sig-retry)`)
+          }
           const retryStr = JSON.stringify(retryPayload)
           const retryHeaders = getAuthHeaders(account, endpoint)
           const retryAgent = getNetworkAgent(account)
@@ -1507,7 +1530,11 @@ async function parseEventStream(
   
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
-  
+  // thinking 内容逐块到达，只在流结束时汇总一条
+  let reasoningEventCount = 0
+  let reasoningChars = 0
+  const reqCtx = getRequestContext()
+
   // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
   // 这里只是兜底初值，后续真实事件会覆盖
   if (payloadStr) {
@@ -1720,10 +1747,11 @@ async function parseEventStream(
       throwIfAborted(signal)
       const { done, value } = await reader.read()
       throwIfAborted(signal)
-      
+
       if (done) {
         break
       }
+      if (reqCtx && reqCtx.firstChunkAt === undefined) reqCtx.firstChunkAt = Date.now()
 
       // 合并缓冲区
       const newBuffer = new Uint8Array(buffer.length + value.length)
@@ -2069,7 +2097,8 @@ async function parseEventStream(
             if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
               const reasoning = event.reasoningContentEvent || event
               if (reasoning.text) {
-                proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
+                reasoningEventCount++
+                reasoningChars += reasoning.text.length
                 await onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
                 usage.reasoningTokens = (usage.reasoningTokens || 0) + Math.max(1, Math.round(reasoning.text.length * 0.4))
@@ -2081,7 +2110,9 @@ async function parseEventStream(
                 proxyLogger.info('Kiro', `Received redacted thinking content (len=${reasoning.redactedContent.length})`)
                 await onChunk('', undefined, true, undefined, reasoning.redactedContent)
               }
-              proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
+              if (logStreamEvents) {
+                proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
+              }
             }
             
             // 处理 codeReferenceEvent - 代码引用/许可证信息
@@ -2248,7 +2279,13 @@ async function parseEventStream(
       const total = Object.values(streamEventCounts).reduce((a, b) => a + b, 0)
       proxyLogger.debug('Kiro', `Stream events summary (${total} total)`, streamEventCounts)
     }
-    
+    if (reasoningEventCount > 0) {
+      proxyLogger.info(
+        'Kiro',
+        `Reasoning content received: ${reasoningEventCount} chunks, ${reasoningChars} chars`
+      )
+    }
+
     throwIfAborted(signal)
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
     onComplete(usage)

@@ -1,6 +1,7 @@
 // 代理服务器日志模块
 import * as fs from 'fs'
 import * as path from 'path'
+import { AsyncLocalStorage } from 'async_hooks'
 import { app } from 'electron'
 import { redactString, redactValue } from '../utils/redact'
 
@@ -10,6 +11,39 @@ export interface LogEntry {
   category: string
   message: string
   data?: unknown
+  /** 所属反代请求 ID；请求处理链路内产生的日志（含 console 拦截）自动带上 */
+  reqId?: string
+}
+
+/** 单个反代请求的上下文：ID + 各阶段时间戳，供请求结束时输出耗时汇总 */
+export interface RequestContext {
+  reqId: string
+  startedAt: number
+  /** 首次发往上游的时刻（之前都是本地预处理） */
+  upstreamStartAt?: number
+  /** 最近一次上游尝试的发起 / 响应头 / 首个数据块时刻 */
+  attemptStartAt?: number
+  upstreamHeadersAt?: number
+  firstChunkAt?: number
+  /** 依次尝试过的上游端点，长度 > 1 即发生过 failover / 重试 */
+  endpoints: string[]
+  /** 模型映射后的模型名；仅模型请求会设置，用于决定是否输出汇总 */
+  model?: string
+}
+
+const requestContextStorage = new AsyncLocalStorage<RequestContext>()
+
+export function runWithRequestContext<T>(ctx: RequestContext, fn: () => T): T {
+  return requestContextStorage.run(ctx, fn)
+}
+
+export function getRequestContext(): RequestContext | undefined {
+  return requestContextStorage.getStore()
+}
+
+export function setRequestModel(model: string | undefined): void {
+  const ctx = requestContextStorage.getStore()
+  if (ctx && model) ctx.model = model
 }
 
 export interface LoggerConfig {
@@ -178,12 +212,14 @@ class ProxyLogger {
     const entry: LogEntry = {
       ...rawEntry,
       message: redactString(rawEntry.message),
-      data: rawEntry.data === undefined ? undefined : redactValue(normalizeErrors(rawEntry.data))
+      data: rawEntry.data === undefined ? undefined : redactValue(normalizeErrors(rawEntry.data)),
+      reqId: rawEntry.reqId ?? getRequestContext()?.reqId
     }
     const line = JSON.stringify(entry) + '\n'
 
     if (this.config.logToConsole) {
-      const prefix = `[${entry.level}][${entry.category}]`
+      const reqTag = entry.reqId ? `[#${entry.reqId}]` : ''
+      const prefix = `[${entry.level}][${entry.category}]${reqTag}`
       // 设置 flag 防止 console 拦截器重复写入 proxyLogStore
       this.isWriting = true
       if (entry.level === 'ERROR') {
@@ -401,6 +437,20 @@ class ProxyLogStore {
     await this.save()
   }
 
+  /** 同步写盘：仅用于进程即将终止、来不及等异步写完成的场景（崩溃、无数据的快速退出） */
+  flushSaveNowSync(): void {
+    if (!this.storePath) return
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer)
+      this.saveTimer = null
+    }
+    try {
+      fs.writeFileSync(this.storePath, JSON.stringify(this.logs), 'utf-8')
+    } catch {
+      /* 终止路径上不再抛出 */
+    }
+  }
+
   getAll(): LogEntry[] {
     return [...this.logs]
   }
@@ -480,7 +530,8 @@ export function interceptConsole(): void {
       level,
       category,
       message: redactString(message),
-      data: data === undefined ? undefined : redactValue(normalizeErrors(data))
+      data: data === undefined ? undefined : redactValue(normalizeErrors(data)),
+      reqId: getRequestContext()?.reqId
     }
   }
 

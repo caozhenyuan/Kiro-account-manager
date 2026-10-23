@@ -620,7 +620,7 @@ interface KiroApi {
   proxyResetRequestStats: () => Promise<{ success: boolean }>
 
   // 获取反代详细日志
-  proxyGetLogs: (count?: number) => Promise<Array<{ timestamp: string; level: string; category: string; message: string; data?: unknown }>>
+  proxyGetLogs: (count?: number) => Promise<Array<{ timestamp: string; level: string; category: string; message: string; data?: unknown; reqId?: string }>>
 
   // 清除反代详细日志
   proxyClearLogs: () => Promise<{ success: boolean }>
@@ -690,7 +690,7 @@ interface KiroApi {
   onProxyRequest: (callback: (info: { path: string; method: string; accountId?: string }) => void) => () => void
 
   // 监听反代响应事件
-  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void) => () => void
+  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; reqId?: string }) => void) => () => void
 
   // 监听反代错误事件
   onProxyError: (callback: (error: string) => void) => () => void

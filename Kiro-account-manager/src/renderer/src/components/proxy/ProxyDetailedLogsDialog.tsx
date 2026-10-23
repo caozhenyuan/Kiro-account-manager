@@ -10,11 +10,14 @@ interface LogEntry {
   category: string
   message: string
   data?: unknown
+  reqId?: string
 }
 
 interface ProxyDetailedLogsDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 打开时预设的请求 ID 过滤（从请求日志跳转过来） */
+  initialReqId?: string | null
 }
 
 // 自定义下拉框组件
@@ -89,66 +92,77 @@ function CustomDropdown({ value, options, onChange, placeholder, className }: Cu
   )
 }
 
-export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLogsDialogProps) {
+export function ProxyDetailedLogsDialog({ open, onOpenChange, initialReqId }: ProxyDetailedLogsDialogProps) {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const [logs, setLogs] = useState<LogEntry[]>([])
+  const [totalCount, setTotalCount] = useState(0)
   const [loading, setLoading] = useState(false)
   const [searchText, setSearchText] = useState('')
   const [levelFilter, setLevelFilter] = useState<string>('all')
   const [categoryFilter, setCategoryFilter] = useState<string>('all')
+  const [reqIdFilter, setReqIdFilter] = useState<string | null>(null)
   const [isAtBottom, setIsAtBottom] = useState(true)
   const [newLogCount, setNewLogCount] = useState(0)
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(new Set())
-  const prevLogCount = useRef(0)
+  // 轮询回调里读最新值，避免把它们放进 effect 依赖导致每次新日志都重建定时器
+  const isAtBottomRef = useRef(true)
+  const lastTimestampRef = useRef<string | undefined>(undefined)
   const [timeRange, setTimeRange] = useState<string>(() => {
     return localStorage.getItem('proxyLogs_timeRange') || 'all'
   })
+  // 默认只拉最近 5000 条：每 1.5 秒全量拉取 5 万条会明显拖慢界面
   const [displayLimit, setDisplayLimit] = useState<string>(() => {
-    return localStorage.getItem('proxyLogs_displayLimit') || 'all'
+    const saved = localStorage.getItem('proxyLogs_displayLimit')
+    // 旧版本存过 5 万～100 万等已移除的选项，统一回落到默认值
+    return saved && ['1000', '5000', '10000', 'all'].includes(saved) ? saved : '5000'
   })
   const scrollRef = useRef<HTMLDivElement>(null)
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
   const loadLogs = useCallback(async () => {
     try {
-      const result = await window.api.proxyGetLogs()
+      const fetchCount = displayLimit === 'all' ? undefined : parseInt(displayLimit) || undefined
+      const [result, count] = await Promise.all([
+        window.api.proxyGetLogs(fetchCount),
+        window.api.proxyGetLogsCount()
+      ])
+      const last = lastTimestampRef.current
+      if (!isAtBottomRef.current && last) {
+        const added = result.filter((l) => l.timestamp > last).length
+        if (added > 0) setNewLogCount((prev) => prev + added)
+      }
+      lastTimestampRef.current = result.length > 0 ? result[result.length - 1].timestamp : undefined
       setLogs(result)
+      setTotalCount(count)
     } catch (error) {
       console.error('Failed to load logs:', error)
     }
-  }, [])
+  }, [displayLimit])
 
   useEffect(() => {
-    if (open) {
-      setLoading(true)
-      loadLogs().finally(() => setLoading(false))
-      
-      // 每 1.5 秒刷新一次
-      pollIntervalRef.current = setInterval(() => {
-        loadLogs().then(() => {
-          // 如果用户不在底部，累计新日志数
-          if (!isAtBottom && logs.length > prevLogCount.current) {
-            setNewLogCount(prev => prev + (logs.length - prevLogCount.current))
-          }
-          prevLogCount.current = logs.length
-        })
-      }, 1500)
-    }
+    if (!open) return
+    setLoading(true)
+    loadLogs().finally(() => setLoading(false))
+    const timer = setInterval(() => void loadLogs(), 1500)
+    return () => clearInterval(timer)
+  }, [open, loadLogs])
 
-    return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current)
-        pollIntervalRef.current = null
-      }
-    }
-  }, [open, loadLogs, isAtBottom, logs.length])
+  // 每次打开时同步外部指定的请求过滤
+  useEffect(() => {
+    if (open) setReqIdFilter(initialReqId ?? null)
+  }, [open, initialReqId])
+
+  const selectReqId = (reqId: string | null): void => {
+    setReqIdFilter(reqId)
+    setExpandedLogs(new Set())
+  }
 
   // 监听滚动位置判断是否在底部
   const handleScroll = useCallback(() => {
     const el = scrollRef.current
     if (!el) return
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+    isAtBottomRef.current = atBottom
     setIsAtBottom(atBottom)
     if (atBottom) setNewLogCount(0)
   }, [])
@@ -156,6 +170,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
   const scrollToBottom = () => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+      isAtBottomRef.current = true
       setIsAtBottom(true)
       setNewLogCount(0)
     }
@@ -179,9 +194,10 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
   }
 
   const handleExportLogs = () => {
-    const content = logs.map(log => {
+    const content = filteredLogs.map(log => {
       const dataStr = log.data ? ` | ${JSON.stringify(log.data)}` : ''
-      return `[${log.timestamp}] [${log.level}] [${log.category}] ${log.message}${dataStr}`
+      const reqStr = log.reqId ? ` [#${log.reqId}]` : ''
+      return `[${log.timestamp}] [${log.level}] [${log.category}]${reqStr} ${log.message}${dataStr}`
     }).join('\n')
 
     const blob = new Blob([content], { type: 'text/plain' })
@@ -195,7 +211,8 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
 
   const handleCopyLog = (log: LogEntry) => {
     const dataStr = log.data ? `\nData: ${JSON.stringify(log.data, null, 2)}` : ''
-    const content = `[${log.timestamp}] [${log.level}] [${log.category}]\n${log.message}${dataStr}`
+    const reqStr = log.reqId ? ` [#${log.reqId}]` : ''
+    const content = `[${log.timestamp}] [${log.level}] [${log.category}]${reqStr}\n${log.message}${dataStr}`
     navigator.clipboard.writeText(content)
   }
 
@@ -246,10 +263,12 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
       }
       if (levelFilter !== 'all' && log.level !== levelFilter) return false
       if (categoryFilter !== 'all' && log.category !== categoryFilter) return false
+      if (reqIdFilter && log.reqId !== reqIdFilter) return false
       if (search) {
-        // 先检查 message 和 category（快速）
+        // 先检查 message、category、reqId（快速）
         if (log.message.toLowerCase().includes(search) ||
-            log.category.toLowerCase().includes(search)) {
+            log.category.toLowerCase().includes(search) ||
+            (log.reqId !== undefined && log.reqId.includes(search))) {
           return true
         }
         // 只有在前面没匹配时才检查 data（慢）
@@ -273,7 +292,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
     
     // 正序，最新在底部（配合智能跟随滚到底部）
     return result
-  }, [logs, timeRange, levelFilter, categoryFilter, searchText, displayLimit])
+  }, [logs, timeRange, levelFilter, categoryFilter, reqIdFilter, searchText, displayLimit])
 
   // 虚拟滚动
   const virtualizer = useVirtualizer({
@@ -347,40 +366,8 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
             <h2 className="text-lg font-semibold">{isEn ? 'Proxy Detailed Logs' : '反代详细日志'}</h2>
           </div>
           <div className="flex items-center gap-2">
-            <CustomDropdown
-              value={timeRange}
-              onChange={setTimeRange}
-              className="min-w-[70px]"
-              options={[
-                { value: 'all', label: isEn ? 'All Time' : '全部时间' },
-                { value: '1h', label: isEn ? '1 Hour' : '1小时' },
-                { value: '6h', label: isEn ? '6 Hours' : '6小时' },
-                { value: '12h', label: isEn ? '12 Hours' : '12小时' },
-                { value: '1d', label: isEn ? '1 Day' : '1天' },
-                { value: '3d', label: isEn ? '3 Days' : '3天' },
-                { value: '7d', label: isEn ? '7 Days' : '7天' },
-                { value: '30d', label: isEn ? '30 Days' : '30天' },
-                { value: '180d', label: isEn ? '180 Days' : '180天' },
-                { value: '1y', label: isEn ? '1 Year' : '1年' },
-              ]}
-            />
-            <CustomDropdown
-              value={displayLimit}
-              onChange={setDisplayLimit}
-              className="min-w-[70px]"
-              options={[
-                { value: 'all', label: isEn ? 'All' : '全部' },
-                { value: '5000', label: '5000' },
-                { value: '10000', label: isEn ? '10K' : '1万' },
-                { value: '50000', label: isEn ? '50K' : '5万' },
-                { value: '100000', label: isEn ? '100K' : '10万' },
-                { value: '200000', label: isEn ? '200K' : '20万' },
-                { value: '500000', label: isEn ? '500K' : '50万' },
-                { value: '1000000', label: isEn ? '1M' : '100万' },
-              ]}
-            />
             <Badge variant="secondary" className="font-mono">
-              {filteredLogs.length} / {logs.length} {isEn ? 'entries' : '条'}
+              {filteredLogs.length.toLocaleString()} / {totalCount.toLocaleString()} {isEn ? 'entries' : '条'}
             </Badge>
             <Button variant="ghost" size="icon" className="rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={() => onOpenChange(false)}>
               <X className="w-4 h-4" />
@@ -439,19 +426,31 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
             ]}
           />
 
+          {/* 请求 ID 过滤（点击日志行上的 #id 或从请求日志跳转设置） */}
+          {reqIdFilter && (
+            <button
+              className="h-8 flex-shrink-0 flex items-center gap-1 px-2 text-xs font-mono rounded-lg bg-primary/15 text-primary hover:bg-primary/25"
+              onClick={() => selectReqId(null)}
+              title={isEn ? 'Clear request filter' : '清除请求过滤'}
+              aria-label={`${isEn ? 'Clear request filter' : '清除请求过滤'} #${reqIdFilter}`}
+            >
+              #{reqIdFilter}
+              <X className="w-3 h-3" />
+            </button>
+          )}
+
           <div className="h-5 w-px bg-border flex-shrink-0" />
 
-          {/* 显示条数 */}
+          {/* 显示条数（同时决定从主进程拉取的条数） */}
           <CustomDropdown
             value={displayLimit}
             onChange={setDisplayLimit}
             className="min-w-[60px]"
             options={[
-              { value: 'all', label: isEn ? 'All' : '全部' },
+              { value: '1000', label: '1K' },
               { value: '5000', label: '5K' },
               { value: '10000', label: '10K' },
-              { value: '50000', label: '50K' },
-              { value: '100000', label: '100K' },
+              { value: 'all', label: isEn ? 'All' : '全部' },
             ]}
           />
 
@@ -522,6 +521,15 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
                           {log.level}
                         </Badge>
                         <span className="text-primary/80 flex-shrink-0 font-medium text-[10px]">{log.category}</span>
+                        {log.reqId && (
+                          <button
+                            className="flex-shrink-0 font-mono text-[10px] text-primary/70 hover:text-primary hover:underline"
+                            title={isEn ? 'Show only this request' : '只看该请求'}
+                            onClick={() => selectReqId(log.reqId!)}
+                          >
+                            #{log.reqId}
+                          </button>
+                        )}
                         <span className="flex-1 break-all text-foreground/90 text-[11px]">{log.message}</span>
                         <div className="flex-shrink-0 opacity-0 group-hover:opacity-100 flex items-center gap-0.5 transition-opacity">
                           {hasData && (
