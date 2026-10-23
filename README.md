@@ -264,6 +264,30 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.13 (2026-10-23) — Log Overhaul (Request IDs / Timing Summaries / Less Noise) + Smaller Installer
+
+#### ✨ Logs Traceable per Request
+
+- **Request IDs**: every proxy request gets a 6-character `reqId`, attached automatically to all logs produced while handling it (including intercepted `console.*` output and endpoint-failure ERRORs). Clicking `#reqId` in System Logs or the proxy's Detailed Logs shows only that request; each row in Request Logs links straight to its detailed logs
+- **Timing summary**: each request ends with one `Request done: <model> <status> total=… local=… ttfb=… via=…` line — total time, local preprocessing, upstream time to first byte, and the endpoints tried (more than one means a failover happened). Aborted or 5xx requests log as WARN. The kind of local blocking fixed in v1.7.12 is now visible at a glance in `local=`
+- **Lifecycle**: startup logs the version / platform / Electron version; main-process uncaught exceptions, unhandled rejections, renderer / child process crashes, quit requests and process exit are all logged, flushing to disk synchronously on crash paths. Previously a crash and a force-quit looked identical in the logs
+
+#### 🔇 Less Noise
+
+- Thinking content is no longer logged chunk by chunk (previously ~40% of all entries); one summary is logged when the stream ends
+- The dozen `- Content length / - Payload size …` lines per upstream request are merged into one, with details in data
+- With the same 50K-entry cap, logs now cover roughly twice the time span
+- Proxy Detailed Logs dialog: fetching all 50K entries every 1.5s replaced by fetching only the displayed count (default 5000); fixed the polling timer being recreated on every new entry and the new-entry counter using stale values; removed the duplicated time range / count selectors
+
+#### 📦 Smaller Installer
+
+- Renderer-only dependencies (lucide-react, framer-motion, tailwind, zustand, etc.) moved to devDependencies — vite already bundles them into the renderer, yet they were also copied verbatim into the asar
+- koffi ships only the target platform's native library; the Windows TLS DLL ships only in Windows builds
+- js-tiktoken now uses the lite entry + `cl100k_base`, dropping the other 6 encoding tables (counts are token-for-token identical)
+- README screenshots moved to `docs/screenshots/`; tests / docs / build scripts are no longer packaged
+
+---
+
 ### v1.7.12 (2026-10-22) — Fix Large-Context Requests Blocking the Main Process (App Freeze)
 
 #### 🐛 Token Counting Froze the Main Process, Seen as an Unresponsive Proxy / App Crash
