@@ -8,6 +8,7 @@ import {
   buildTrend,
   computeMonthlyAnalytics,
   cycleOf,
+  snapshotKey,
   type UsageHistory
 } from '../src/renderer/src/lib/usageAnalytics'
 import {
@@ -43,15 +44,22 @@ function account(
     reset?: string
     type?: string
     title?: string
+    email?: string
+    region?: string
   } = {}
 ): Account {
   return {
     id,
+    email: over.email ?? `${id}@example.com`,
     status: over.status ?? 'active',
     usage: { current: over.current ?? 0, limit: over.limit ?? 1000, nextResetDate: over.reset },
-    subscription: { type: over.type ?? 'Pro', title: over.title }
+    subscription: { type: over.type ?? 'Pro', title: over.title },
+    credentials: { region: 'us-east-1', apiRegion: over.region }
   } as unknown as Account
 }
+
+const R = 'us-east-1'
+const k = (id: string, region = R): string => snapshotKey(id, region)
 
 function snap(
   c: number,
@@ -163,11 +171,11 @@ async function main(): Promise<void> {
   console.log('[smoke] 每日趋势')
   {
     const h: UsageHistory = {
-      '2026-10-16': { a: snap(100), b: snap(10) },
-      '2026-10-17': { a: snap(130), b: snap(20) },
-      '2026-10-18': { a: snap(130), b: snap(25) },
+      '2026-10-16': { [k('a')]: snap(100), [k('b')]: snap(10) },
+      '2026-10-17': { [k('a')]: snap(130), [k('b')]: snap(20) },
+      '2026-10-18': { [k('a')]: snap(130), [k('b')]: snap(25) },
       // 10-19 应用没开：10-20 的差值整段记到 10-20
-      '2026-10-20': { a: snap(190), b: snap(35) }
+      '2026-10-20': { [k('a')]: snap(190), [k('b')]: snap(35) }
     }
     const { trend, resetCount } = buildTrend(h, NOW, 7)
     const by = Object.fromEntries(trend.map((p) => [p.day, p]))
@@ -217,9 +225,9 @@ async function main(): Promise<void> {
   console.log('[smoke] 周期重置（用量回落）')
   {
     const h: UsageHistory = {
-      '2026-10-18': { a: snap(900) },
-      '2026-10-19': { a: snap(950) },
-      '2026-10-20': { a: snap(20) } // 重置后清零再用了一点
+      '2026-10-18': { [k('a')]: snap(900) },
+      '2026-10-19': { [k('a')]: snap(950) },
+      '2026-10-20': { [k('a')]: snap(20) } // 重置后清零再用了一点
     }
     const { trend, resetCount } = buildTrend(h, NOW, 3)
     check('回落那天不计负消耗', trend[2].used === 0, String(trend[2].used))
@@ -230,10 +238,10 @@ async function main(): Promise<void> {
   console.log('[smoke] 窗口外的重置不计入提示')
   {
     const h: UsageHistory = {
-      '2026-08-01': { a: snap(900) },
-      '2026-08-02': { a: snap(5) },
-      '2026-10-19': { a: snap(10) },
-      '2026-10-20': { a: snap(30) }
+      '2026-08-01': { [k('a')]: snap(900) },
+      '2026-08-02': { [k('a')]: snap(5) },
+      '2026-10-19': { [k('a')]: snap(10) },
+      '2026-10-20': { [k('a')]: snap(30) }
     }
     const { resetCount, trend } = buildTrend(h, NOW, 7)
     check('8 月的重置不在 7 天窗口内', resetCount === 0, String(resetCount))
@@ -255,27 +263,156 @@ async function main(): Promise<void> {
       }
     }
     const s = extractSnapshots(data)
-    check('只提取正常且有额度的账号', Object.keys(s).join() === 'a', Object.keys(s).join())
-    check('current 保留两位小数', s.a.c === 12.35, String(s.a.c))
-    check('带上订阅类型与重置日', s.a.t === 'Pro' && s.a.r === 'x')
+    check('只提取正常且有额度的账号', Object.keys(s).join() === k('a'), Object.keys(s).join())
+    check('current 保留两位小数', s[k('a')].c === 12.35, String(s[k('a')].c))
+    check('带上订阅类型、重置日与区域', s[k('a')].t === 'Pro' && s[k('a')].r === 'x' && s[k('a')].g === R)
     check(
       '非法输入返回空',
       Object.keys(extractSnapshots(null)).length === 0 &&
         Object.keys(extractSnapshots({})).length === 0
     )
 
-    let hist = mergeSnapshots({}, { a: { c: 1, l: 10 } }, NOW)
-    hist = mergeSnapshots(hist, { a: { c: 2, l: 10 }, b: { c: 3, l: 10 } }, NOW)
+    let hist = mergeSnapshots({}, { [k('a')]: { c: 1, l: 10 } }, NOW)
+    hist = mergeSnapshots(hist, { [k('a')]: { c: 2, l: 10 }, [k('b')]: { c: 3, l: 10 } }, NOW)
     check(
       '同一天后写覆盖先写，账号并集',
-      hist['2026-10-20'].a.c === 2 && hist['2026-10-20'].b.c === 3
+      hist['2026-10-20'][k('a')].c === 2 && hist['2026-10-20'][k('b')].c === 3
     )
 
     const old = new Date(NOW)
     old.setDate(old.getDate() - HISTORY_RETENTION_DAYS - 5)
     const oldKey = `${old.getFullYear()}-${String(old.getMonth() + 1).padStart(2, '0')}-${String(old.getDate()).padStart(2, '0')}`
-    const pruned = mergeSnapshots({ [oldKey]: { a: { c: 1, l: 1 } } }, { a: { c: 2, l: 10 } }, NOW)
+    const pruned = mergeSnapshots({ [oldKey]: { [k('a')]: { c: 1, l: 1 } } }, { [k('a')]: { c: 2, l: 10 } }, NOW)
     check(`超过 ${HISTORY_RETENTION_DAYS} 天的快照被裁掉`, !(oldKey in pruned))
+  }
+
+  console.log('[smoke] 同一邮箱两个额度区域')
+  {
+    const EU = 'eu-central-1'
+    const RESET = iso(2026, 11, 1)
+
+    // 趋势：同一账号来回切换区域，各区域独立差分，不跨区域相减
+    const h: UsageHistory = {
+      '2026-10-18': { [k('a', R)]: snap(10277) },
+      // 10-19 切到法兰克福：美东快照停止更新，欧洲从 0 开始
+      '2026-10-19': { [k('a', EU)]: snap(0) },
+      '2026-10-20': { [k('a', EU)]: snap(15) }
+    }
+    const { trend, resetCount } = buildTrend(h, NOW, 3)
+    check('切换区域不产生"周期重置"误报', resetCount === 0, String(resetCount))
+    check(
+      '切换当天不会把 0 当成消耗或重置',
+      trend[1].used === 0 && trend[1].hasData === false,
+      JSON.stringify(trend[1])
+    )
+    check('欧洲区域 10-20 消耗 = 15', trend[2].used === 15, String(trend[2].used))
+
+    // 切回美东：只记美东序列自己的增量（10300-10277），不会拿它去和欧洲的 0/15 相减
+    const back: UsageHistory = {
+      ...h,
+      '2026-10-20': { [k('a', R)]: snap(10300), [k('a', EU)]: snap(15) }
+    }
+    const t2 = buildTrend(back, NOW, 3).trend
+    check('切回美东：美东增量 23 + 欧洲增量 15 = 38', t2[2].used === 38, String(t2[2].used))
+
+    // 汇总：当前区域取实时值，另一区域取历史快照（重置日未过）
+    const history: UsageHistory = {
+      '2026-10-18': {
+        [k('a', R)]: { c: 1800, l: 10000, t: 'KIRO POWER', r: RESET, g: R }
+      },
+      '2026-10-20': { [k('a', EU)]: { c: 15, l: 2000, t: 'KIRO PRO+', r: RESET, g: EU } }
+    }
+    const now = computeMonthlyAnalytics(
+      [account('a', { email: 'Me@Corp.com', region: EU, current: 15, limit: 2000, reset: RESET, title: 'KIRO PRO+' })],
+      history,
+      NOW
+    )
+    check('账号按邮箱去重：1 个账号', now.accountCount === 1, String(now.accountCount))
+    check('额度份数 2', now.quotaCount === 2, String(now.quotaCount))
+    check('另一区域来自历史快照 1 份', now.otherRegionCount === 1)
+    check('最早快照日期', now.otherRegionOldestDay === '2026-10-18', String(now.otherRegionOldestDay))
+    check(
+      '总额度 = 2000 + 10000',
+      now.totalLimit === 12000 && now.totalUsed === 1815,
+      `${now.totalLimit}/${now.totalUsed}`
+    )
+    check(
+      '订阅分布按套餐名拆开且份数合计等于额度份数',
+      now.bySubscription.length === 2 &&
+        now.bySubscription.reduce((s, x) => s + x.count, 0) === now.quotaCount,
+      JSON.stringify(now.bySubscription)
+    )
+
+    // 另一区域快照的重置日已过：视为已重置，不再计入
+    const staleHistory: UsageHistory = {
+      '2026-09-10': { [k('a', R)]: { c: 9000, l: 10000, t: 'KIRO POWER', r: iso(2026, 10, 1), g: R } }
+    }
+    const stale = computeMonthlyAnalytics(
+      [account('a', { region: EU, current: 15, limit: 2000, reset: RESET })],
+      staleHistory,
+      NOW
+    )
+    check(
+      '过期的其它区域快照不计入',
+      stale.otherRegionCount === 0 && stale.totalLimit === 2000 && stale.quotaCount === 1,
+      JSON.stringify([stale.otherRegionCount, stale.totalLimit, stale.quotaCount])
+    )
+
+    // 同一邮箱建了两条记录（各一个区域）：账号数合并为 1，额度份数 2，且不重复计入历史
+    const twoRecords = computeMonthlyAnalytics(
+      [
+        account('r1', { email: 'me@corp.com', region: R, current: 100, limit: 10000, reset: RESET, title: 'KIRO POWER' }),
+        account('r2', { email: 'ME@corp.com', region: EU, current: 15, limit: 2000, reset: RESET, title: 'KIRO PRO+' })
+      ],
+      {
+        '2026-10-20': {
+          [k('r1', R)]: { c: 100, l: 10000, t: 'KIRO POWER', r: RESET, g: R },
+          [k('r2', EU)]: { c: 15, l: 2000, t: 'KIRO PRO+', r: RESET, g: EU }
+        }
+      },
+      NOW
+    )
+    check(
+      '两条记录同邮箱：账号 1、额度 2、不用历史重复计入',
+      twoRecords.accountCount === 1 &&
+        twoRecords.quotaCount === 2 &&
+        twoRecords.otherRegionCount === 0 &&
+        twoRecords.totalLimit === 12000,
+      JSON.stringify([twoRecords.accountCount, twoRecords.quotaCount, twoRecords.otherRegionCount, twoRecords.totalLimit])
+    )
+
+    // 非 active 账号不应借历史把另一区域的额度算进来
+    const banned = computeMonthlyAnalytics(
+      [account('a', { status: 'error', region: EU, current: 15, limit: 2000, reset: RESET })],
+      history,
+      NOW
+    )
+    check('异常账号的历史快照也不计入', banned.quotaCount === 0 && banned.totalLimit === 0)
+  }
+
+  console.log('[smoke] 快照按区域分序列')
+  {
+    const s = extractSnapshots({
+      accounts: {
+        a: {
+          status: 'active',
+          usage: { current: 1, limit: 10 },
+          subscription: { type: 'Pro', title: 'KIRO PRO+' },
+          credentials: { region: 'us-east-1', apiRegion: 'eu-central-1' }
+        },
+        b: {
+          status: 'active',
+          usage: { current: 2, limit: 10 },
+          subscription: { type: 'Pro' },
+          credentials: { region: 'eu-west-1' }
+        },
+        c: { status: 'active', usage: { current: 3, limit: 10 }, subscription: { type: 'Free' } }
+      }
+    })
+    check('键含额度区域（apiRegion 优先）', k('a', 'eu-central-1') in s, Object.keys(s).join())
+    check('无 apiRegion 回落登录区域', k('b', 'eu-west-1') in s, Object.keys(s).join())
+    check('都没有时回落 us-east-1', k('c', 'us-east-1') in s, Object.keys(s).join())
+    check('订阅取套餐名', s[k('a', 'eu-central-1')].t === 'KIRO PRO+')
   }
 
   console.log('[smoke] 历史存储落盘与恢复')
@@ -311,12 +448,12 @@ async function main(): Promise<void> {
       const raw = JSON.parse(
         await fs.readFile(join(dir, 'usage-history.json'), 'utf-8')
       ) as UsageHistory
-      check('落盘后同日只保留最后一次', raw['2026-10-20']?.a?.c === 9, JSON.stringify(raw))
+      check('落盘后同日只保留最后一次', raw['2026-10-20']?.[k('a')]?.c === 9, JSON.stringify(raw))
       const leftovers = (await fs.readdir(dir)).filter((f) => f.endsWith('.tmp'))
       check('不残留临时文件', leftovers.length === 0, leftovers.join())
 
       const reopened = new UsageHistoryStore(dir)
-      check('重新打开能读回', (await reopened.get())['2026-10-20']?.a?.c === 9)
+      check('重新打开能读回', (await reopened.get())['2026-10-20']?.[k('a')]?.c === 9)
 
       await fs.writeFile(join(dir, 'usage-history.json'), '{ broken json', 'utf-8')
       const corrupt = new UsageHistoryStore(dir)

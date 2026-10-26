@@ -1,4 +1,4 @@
-// 用量历史快照：按天记录各账号的 usage.current / limit，供首页「月度额度分析」画每日趋势。
+// 用量历史快照：按天记录各账号（按额度区域区分）的 usage.current / limit，供首页「月度额度分析」画每日趋势。
 // 独立文件存放，不进账号数据：账号库每次写盘都要整库加解密，历史会随天数增长。
 import { promises as fs } from 'fs'
 import { join } from 'path'
@@ -11,19 +11,36 @@ export interface AccountDaySnapshot {
   c: number
   /** usage.limit */
   l: number
-  /** 订阅类型，用于按类型汇总 */
+  /** 订阅名称（优先 title，如 KIRO PRO+），用于按类型汇总 */
   t?: string
-  /** 该账号的下次重置时间（ISO），重置前后用量会清零，趋势差值据此判断 */
+  /** 该额度的下次重置时间（ISO），重置前后用量会清零，趋势差值据此判断 */
   r?: string
+  /** 额度区域 */
+  g?: string
 }
 
-/** 日期（本地时区 YYYY-MM-DD）→ 账号 ID → 当天最后一次快照 */
+/** 日期（本地时区 YYYY-MM-DD）→ 序列键 `${账号ID}|${额度区域}` → 当天最后一次快照 */
 export type UsageHistory = Record<string, Record<string, AccountDaySnapshot>>
 
 interface AccountLike {
   status?: string
   usage?: { current?: number; limit?: number; nextResetDate?: string }
-  subscription?: { type?: string }
+  subscription?: { type?: string; title?: string }
+  credentials?: { region?: string; apiRegion?: string }
+}
+
+/**
+ * 同一账号可在不同额度区域各有一份独立额度（各自的订阅、用量、重置周期），
+ * 所以按「账号 + 额度区域」分序列记录，趋势差值才不会跨区域相减。
+ * 键格式与渲染端 lib/usageAnalytics.ts 的 snapshotKey 保持一致。
+ */
+export function snapshotKey(id: string, region: string): string {
+  return `${id}|${region}`
+}
+
+/** 与反代 getApiRegion 同口径：apiRegion → region → us-east-1 */
+export function apiRegionOf(acc: AccountLike): string {
+  return acc.credentials?.apiRegion || acc.credentials?.region || 'us-east-1'
 }
 
 export function dayKey(date: Date): string {
@@ -43,10 +60,12 @@ export function extractSnapshots(data: unknown): Record<string, AccountDaySnapsh
     const limit = Number(acc.usage?.limit)
     const current = Number(acc.usage?.current)
     if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(current)) continue
-    const snap: AccountDaySnapshot = { c: round2(current), l: round2(limit) }
-    if (acc.subscription?.type) snap.t = acc.subscription.type
+    const region = apiRegionOf(acc)
+    const snap: AccountDaySnapshot = { c: round2(current), l: round2(limit), g: region }
+    const plan = acc.subscription?.title || acc.subscription?.type
+    if (plan) snap.t = plan
     if (acc.usage?.nextResetDate) snap.r = acc.usage.nextResetDate
-    out[id] = snap
+    out[snapshotKey(id, region)] = snap
   }
   return out
 }

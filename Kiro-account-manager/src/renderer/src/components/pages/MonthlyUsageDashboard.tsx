@@ -82,7 +82,14 @@ export function MonthlyUsageDashboard({
       key: 'total',
       label: isEn ? 'Total Quota' : '总额度',
       value: fmt(data.totalLimit),
-      hint: isEn ? `${data.accountCount} active accounts` : `${data.accountCount} 个正常账号`,
+      hint:
+        data.quotaCount === data.accountCount
+          ? isEn
+            ? `${data.accountCount} active accounts`
+            : `${data.accountCount} 个正常账号`
+          : isEn
+            ? `${data.accountCount} accounts · ${data.quotaCount} quotas`
+            : `${data.accountCount} 个账号 · ${data.quotaCount} 份额度`,
       tone: 'text-blue-500'
     },
     {
@@ -165,12 +172,19 @@ export function MonthlyUsageDashboard({
             <TrendChart data={data} isEn={isEn} />
           </div>
           <div className="min-w-0">
-            <SubscriptionDonut slices={data.bySubscription} total={data.accountCount} isEn={isEn} />
+            <SubscriptionDonut slices={data.bySubscription} total={data.quotaCount} isEn={isEn} />
           </div>
         </div>
 
-        {(data.fallbackCycleAccounts > 0 || data.resetCount > 0) && (
+        {(data.fallbackCycleAccounts > 0 || data.resetCount > 0 || data.otherRegionCount > 0) && (
           <ul className="text-[11px] text-muted-foreground space-y-0.5 list-disc pl-4">
+            {data.otherRegionCount > 0 && (
+              <li>
+                {isEn
+                  ? `${data.otherRegionCount} quota(s) in other regions are taken from the latest snapshot (as of ${data.otherRegionOldestDay}); they refresh only when you switch to that region.`
+                  : `${data.otherRegionCount} 份其它额度区域的额度取自最近一次快照（最早 ${data.otherRegionOldestDay}），切换到该区域后才会刷新。`}
+              </li>
+            )}
             {data.fallbackCycleAccounts > 0 && (
               <li>
                 {isEn
