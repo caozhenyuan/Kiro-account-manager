@@ -124,7 +124,8 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
           account.machineId,
           account.credentials.provider || account.idp,
           account.credentials.authMethod,
-          account.id
+          account.id,
+          account.credentials.apiRegion
         )
         if (accountModels.success && accountModels.models.length > 0) {
           setModels(accountModels.models)

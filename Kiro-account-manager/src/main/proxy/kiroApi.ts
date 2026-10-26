@@ -2523,14 +2523,15 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     }
   }
 
+  // profileArn 决策由 resolveProfileArn 统一处理：
+  //   - Github/Google → 固定 social ARN
+  //   - Enterprise → 组织真实 ARN（上方已自愈获取；拿不到则不附加）
+  //   - BuilderId → 不附加（附加占位符会 403，见 issue #99）
+  const arnForModels = resolveProfileArn(account)
+
   try {
     do {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      const arnForModels = resolveProfileArn(account)
-      // profileArn 决策由 resolveProfileArn 统一处理：
-      //   - Github/Google → 固定 social ARN
-      //   - Enterprise → 组织真实 ARN（上方已自愈获取；拿不到则不附加）
-      //   - BuilderId → 不附加（附加占位符会 403，见 issue #99）
       if (arnForModels) params.set('profileArn', arnForModels)
       if (nextToken) params.set('nextToken', nextToken)
 
@@ -2541,7 +2542,11 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       
       if (!response.ok) {
         const errBody = await response.text().catch(() => '')
-        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status}`, errBody.slice(0, 300))
+        const arnRegion = arnForModels?.split(':')[3] ?? 'none'
+        console.error(
+          `[KiroAPI] ListAvailableModels failed: ${response.status} (endpoint=${new URL(baseUrl).hostname}, apiRegion=${getApiRegion(account)}, arnRegion=${arnRegion})`,
+          errBody.slice(0, 300)
+        )
         break
       }
 

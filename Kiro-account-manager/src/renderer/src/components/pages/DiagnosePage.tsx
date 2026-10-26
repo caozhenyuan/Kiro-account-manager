@@ -201,6 +201,7 @@ export function DiagnosePage(): React.ReactNode {
           clientId: cred.clientId,
           clientSecret: cred.clientSecret,
           region: cred.region,
+          apiRegion: cred.apiRegion,
           authMethod: cred.authMethod,
           provider: cred.provider,
           profileArn: account.profileArn,

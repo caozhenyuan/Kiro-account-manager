@@ -101,7 +101,8 @@ export function AccountDetailDialog({
         account.machineId,
         account.credentials.provider || account.idp,
         account.credentials.authMethod,
-        account.id
+        account.id,
+        account.credentials.apiRegion
       )
         .then(result => {
           if (result.success) {
@@ -115,7 +116,7 @@ export function AccountDetailDialog({
     } else {
       setModels([])
     }
-  }, [open, account?.credentials?.accessToken, account?.credentials?.region, account?.profileArn, account?.machineId, account?.credentials?.provider, account?.idp, account?.credentials?.authMethod, account?.id])
+  }, [open, account?.credentials?.accessToken, account?.credentials?.region, account?.credentials?.apiRegion, account?.profileArn, account?.machineId, account?.credentials?.provider, account?.idp, account?.credentials?.authMethod, account?.id])
 
   if (!open || !account) return null
 

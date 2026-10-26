@@ -754,8 +754,8 @@ const api = {
   },
 
   // 获取账户可用模型列表
-  accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }> => {
-    return ipcRenderer.invoke('account-get-models', accessToken, region, profileArn, machineId, provider, authMethod, accountId)
+  accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string, apiRegion?: string): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }> => {
+    return ipcRenderer.invoke('account-get-models', accessToken, region, profileArn, machineId, provider, authMethod, accountId, apiRegion)
   },
 
   // 获取可用订阅列表
@@ -1299,7 +1299,7 @@ const api = {
   diagnoseAccountLiveness: (params: {
     account: {
       id?: string; email?: string; accessToken?: string; refreshToken?: string
-      clientId?: string; clientSecret?: string; region?: string
+      clientId?: string; clientSecret?: string; region?: string; apiRegion?: string
       authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
       profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
     }

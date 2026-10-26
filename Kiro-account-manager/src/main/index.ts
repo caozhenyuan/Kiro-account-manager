@@ -2387,6 +2387,7 @@ function createWindow(): void {
                 clientId: acc.credentials?.clientId,
                 clientSecret: acc.credentials?.clientSecret,
                 region: acc.credentials?.region || 'us-east-1',
+                apiRegion: acc.credentials?.apiRegion,
                 authMethod,
                 provider,
                 proxyUrl: buildProxyUrl(acc.id)
@@ -3034,6 +3035,7 @@ app.whenReady().then(async () => {
     }
     model?: string
     message?: string
+      apiRegion?: string
     timeoutMs?: number
   }) => {
     const acc = params?.account
@@ -3084,6 +3086,7 @@ app.whenReady().then(async () => {
       }
 
       // 3) 构建最小 OpenAI chat 请求 → 转 Kiro payload
+        apiRegion: acc.apiRegion,
       const payload = openaiToKiro({
         model,
         messages: [{ role: 'user', content: message }],
@@ -5991,6 +5994,7 @@ app.whenReady().then(async () => {
           id: m.modelId,
           name: m.modelName,
           description: m.description
+        apiRegion: account.credentials?.apiRegion,
         }))
       }
     } catch (error) {
@@ -6782,7 +6786,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 获取账户可用模型列表
-  ipcMain.handle('account-get-models', async (_event, accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
+  ipcMain.handle('account-get-models', async (_event, accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string, apiRegion?: string) => {
     try {
       const models = await fetchKiroModels({
         id: accountId || 'model-list-request',
@@ -6797,6 +6801,7 @@ app.whenReady().then(async () => {
         success: true,
         models: models.map(m => ({
           id: m.modelId,
+        apiRegion,
           name: m.modelName,
           description: m.description,
           inputTypes: m.supportedInputTypes,
