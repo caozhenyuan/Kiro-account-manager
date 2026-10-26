@@ -137,6 +137,12 @@ interface StatusResult {
 
 interface KiroApi {
   openExternal: (url: string, usePrivateMode?: boolean) => void
+  reportRendererError: (info: {
+    scope: string
+    message: string
+    stack?: string
+    componentStack?: string
+  }) => void
   getAppVersion: () => Promise<string>
   onAuthCallback: (callback: (data: { code: string; state: string }) => void) => () => void
 

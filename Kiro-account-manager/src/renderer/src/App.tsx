@@ -6,6 +6,7 @@ import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, Pro
 import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { useAccountsStore, isBannedAccountError, isPermanentAuthFailure } from './store/accounts'
 
 // 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
@@ -436,7 +437,9 @@ function App(): React.JSX.Element {
               transition={{ duration: 0.25, ease: [0.4, 0, 0.2, 1] }}
               className="h-full flex flex-col"
             >
-              {renderPage()}
+              <ErrorBoundary scope={`page:${currentPage}`} resetKeys={[currentPage]}>
+                {renderPage()}
+              </ErrorBoundary>
             </motion.div>
           </AnimatePresence>
         </main>

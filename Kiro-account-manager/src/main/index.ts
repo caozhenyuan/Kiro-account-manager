@@ -2646,6 +2646,15 @@ app.whenReady().then(async () => {
     optimizer.watchWindowShortcuts(window)
   })
 
+  // IPC: 渲染进程 ErrorBoundary 上报，经 console 拦截器落入系统日志（含脱敏）
+  ipcMain.on('renderer-error', (_event, info: { scope?: unknown; message?: unknown; stack?: unknown; componentStack?: unknown }) => {
+    const text = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '')
+    console.error(
+      `[Renderer] ${text(info?.scope, 40) || 'unknown'} render error: ${text(info?.message, 300)}`,
+      { stack: text(info?.stack, 1500), componentStack: text(info?.componentStack, 1500) }
+    )
+  })
+
   // IPC: 打开外部链接
   ipcMain.on('open-external', (_event, url: string, usePrivateMode?: boolean) => {
     if (typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'))) {
@@ -3026,6 +3035,7 @@ app.whenReady().then(async () => {
       clientId?: string
       clientSecret?: string
       region?: string
+      apiRegion?: string
       authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
       provider?: string
       profileArn?: string
@@ -3035,7 +3045,6 @@ app.whenReady().then(async () => {
     }
     model?: string
     message?: string
-      apiRegion?: string
     timeoutMs?: number
   }) => {
     const acc = params?.account
@@ -3077,6 +3086,7 @@ app.whenReady().then(async () => {
         clientId: acc.clientId,
         clientSecret: acc.clientSecret,
         region: acc.region || 'us-east-1',
+        apiRegion: acc.apiRegion,
         authMethod: acc.authMethod,
         provider: acc.provider,
         profileArn: acc.profileArn,
@@ -3086,7 +3096,6 @@ app.whenReady().then(async () => {
       }
 
       // 3) 构建最小 OpenAI chat 请求 → 转 Kiro payload
-        apiRegion: acc.apiRegion,
       const payload = openaiToKiro({
         model,
         messages: [{ role: 'user', content: message }],
@@ -5985,6 +5994,7 @@ app.whenReady().then(async () => {
         clientId: account.credentials?.clientId,
         clientSecret: account.credentials?.clientSecret,
         region: account.credentials?.region || 'us-east-1',
+        apiRegion: account.credentials?.apiRegion,
         authMethod: account.credentials?.authMethod
       }
 
@@ -5994,7 +6004,6 @@ app.whenReady().then(async () => {
           id: m.modelId,
           name: m.modelName,
           description: m.description
-        apiRegion: account.credentials?.apiRegion,
         }))
       }
     } catch (error) {
@@ -6792,6 +6801,7 @@ app.whenReady().then(async () => {
         id: accountId || 'model-list-request',
         accessToken,
         region: region || 'us-east-1',
+        apiRegion,
         profileArn,
         machineId,
         provider,
@@ -6801,7 +6811,6 @@ app.whenReady().then(async () => {
         success: true,
         models: models.map(m => ({
           id: m.modelId,
-        apiRegion,
           name: m.modelName,
           description: m.description,
           inputTypes: m.supportedInputTypes,

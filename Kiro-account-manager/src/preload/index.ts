@@ -8,6 +8,16 @@ const api = {
     ipcRenderer.send('open-external', url, usePrivateMode)
   },
 
+  // 渲染进程错误上报（ErrorBoundary 捕获后写入主进程系统日志）
+  reportRendererError: (info: {
+    scope: string
+    message: string
+    stack?: string
+    componentStack?: string
+  }): void => {
+    ipcRenderer.send('renderer-error', info)
+  },
+
   // 获取应用版本
   getAppVersion: (): Promise<string> => {
     return ipcRenderer.invoke('get-app-version')

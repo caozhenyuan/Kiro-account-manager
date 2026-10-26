@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
+import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { AccountGrid } from './AccountGrid'
 import { AccountList } from './AccountList'
 import { AddAccountDialog } from './AddAccountDialog'
@@ -268,17 +269,19 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       <div className="flex-1 overflow-hidden flex flex-col px-3 py-3 gap-3">
         {/* 账号列表（卡片 或 紧凑列表） */}
         <div className="flex-1 overflow-hidden">
-          {viewMode === 'grid' ? (
-            <AccountGrid
-              onAddAccount={() => setShowAddDialog(true)}
-              onEditAccount={handleEditAccount}
-            />
-          ) : (
-            <AccountList
-              onAddAccount={() => setShowAddDialog(true)}
-              onEditAccount={handleEditAccount}
-            />
-          )}
+          <ErrorBoundary scope="accounts-list" resetKeys={[accounts, viewMode]}>
+            {viewMode === 'grid' ? (
+              <AccountGrid
+                onAddAccount={() => setShowAddDialog(true)}
+                onEditAccount={handleEditAccount}
+              />
+            ) : (
+              <AccountList
+                onAddAccount={() => setShowAddDialog(true)}
+                onEditAccount={handleEditAccount}
+              />
+            )}
+          </ErrorBoundary>
         </div>
       </div>
 
