@@ -275,6 +275,12 @@ The project is configured with GitHub Actions workflow for auto building all pla
 - **Data source**: the main process records a per-day usage snapshot whenever accounts are saved, stored in `userData/usage-history.json` and kept for 90 days. Snapshots start with this release, so the trend chart needs at least two days of data; until then the daily average is estimated as "used this cycle ÷ days elapsed"
 - Pure SVG, no new chart dependency
 
+#### 🌐 Dashboard Handles Multiple Quota Regions per Email
+
+- **Per-region series**: usage snapshots are keyed by account ID plus quota region, so each region's daily consumption is computed independently. Switching quota region is no longer mistaken for a cycle reset, and switching back no longer produces a bogus spike
+- **Merged multi-region quota**: the current region uses live data and other regions use their latest snapshot (ones whose reset date has passed are dropped). The total card shows "N accounts · M quotas", accounts are de-duplicated by email, and the subscription mix is split by plan name
+- **Note**: quota in other regions is not live; it updates only after you switch to that region and refresh, and the dashboard shows the oldest snapshot date
+
 #### 🌍 Fix `400 Invalid profileArn` on the Model List After Switching Quota Region
 
 - **Symptom**: after switching an Enterprise account's quota region to eu-central-1, `ListAvailableModels` returned 400 `Invalid profileArn`
