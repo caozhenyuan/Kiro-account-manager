@@ -264,6 +264,30 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.15 (2026-10-26) — Monthly Quota Dashboard + Quota Region Fix + Render Error Boundary
+
+#### 📊 New "Monthly Quota Analysis" Dashboard on the Home Page
+
+- **Metric cards**: total quota, used, remaining (with days left at the current pace), daily average, and end-of-cycle projection (shown in red when it would exceed the quota)
+- **Daily usage trend**: 30-day bar chart with a dashed average line; shows "history accumulating" until at least two days of data exist
+- **Subscription mix**: donut chart with a legend showing account count and quota per type
+- **Scope**: each account is measured on its own reset cycle (`nextResetDate`), and only accounts in the normal state are counted; usage drops caused by a cycle reset are not counted as consumption
+- **Data source**: the main process records a per-day usage snapshot whenever accounts are saved, stored in `userData/usage-history.json` and kept for 90 days. Snapshots start with this release, so the trend chart needs at least two days of data; until then the daily average is estimated as "used this cycle ÷ days elapsed"
+- Pure SVG, no new chart dependency
+
+#### 🌍 Fix `400 Invalid profileArn` on the Model List After Switching Quota Region
+
+- **Symptom**: after switching an Enterprise account's quota region to eu-central-1, `ListAvailableModels` returned 400 `Invalid profileArn`
+- **Cause**: the lazy account-pool load at startup, account liveness test, the settings-page model fetch and `account-get-models` built accounts without `apiRegion`, so the request hit the login-region endpoint while carrying a profileArn from the quota region
+- **Fix**: those entry points and their renderer callers now pass `apiRegion`; the `ListAvailableModels` failure log now includes `endpoint` / `apiRegion` / `arnRegion` to make region mismatches easy to spot
+
+#### 🛡️ New Render Error Boundary
+
+- The account list, the home-page quota dashboard and every page are now wrapped in a boundary: when one area fails to render it shows an error with a "Retry" button instead of blanking the whole page, and recovers automatically when data changes or you switch pages
+- Render errors are written to System Logs through a new `renderer-error` IPC (`[Renderer] <scope> render error`, with the existing redaction), so a recurrence can be diagnosed from the log
+
+---
+
 ### v1.7.14 (2026-10-23) — Faster Local Preprocessing (Token-Count Cache)
 
 #### ⚡ Local Preprocessing for Large-Context Sessions Drops from Hundreds of ms to Single Digits
