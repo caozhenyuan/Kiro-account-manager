@@ -101,7 +101,7 @@ interface TrayCallbacks {
   onRefreshAccount: () => Promise<void>
   onSwitchAccount: () => Promise<void>
   onToggleProxy: () => Promise<void>
-  getProxyStatus: () => { running: boolean; port: number }
+  getProxyStatus: () => { running: boolean; port: number; host?: string; https?: boolean }
   getCurrentAccount: () => TrayAccountInfo | null
   getAccountList: () => TrayAccountInfo[]
   getProxyStats: () => { totalRequests: number; successRequests: number; failedRequests: number }
@@ -257,7 +257,10 @@ function buildTrayMenu(): Menu {
       const { clipboard } = require('electron')
       const proxyStatus = callbacks?.getProxyStatus()
       if (proxyStatus?.running) {
-        clipboard.writeText(`http://127.0.0.1:${proxyStatus.port}`)
+        // 监听 0.0.0.0 / :: 时本机访问用回环地址；其余按配置的 host，开了 TLS 则是 https
+        const host = !proxyStatus.host || proxyStatus.host === '0.0.0.0' || proxyStatus.host === '::' ? '127.0.0.1' : proxyStatus.host
+        const hostPart = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+        clipboard.writeText(`${proxyStatus.https ? 'https' : 'http'}://${hostPart}:${proxyStatus.port}`)
       }
     },
     enabled: callbacks?.getProxyStatus()?.running ?? false

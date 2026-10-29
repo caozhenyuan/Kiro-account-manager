@@ -194,7 +194,7 @@ const api = {
     profileArn?: string
     provider?: string
     scopes?: string[]
-  }): Promise<{ success: boolean; error?: string; dbPath?: string }> => {
+  }): Promise<{ success: boolean; error?: string; dbPath?: string; refreshedCredentials?: { accessToken: string; refreshToken: string; expiresIn: number } }> => {
     return ipcRenderer.invoke('switch-account-cli', credentials)
   },
 
@@ -209,7 +209,7 @@ const api = {
   },
 
   // 文件操作 - 从文件导入
-  importFromFile: (): Promise<string | null> => {
+  importFromFile: (): Promise<{ content: string; format: string } | null> => {
     return ipcRenderer.invoke('import-from-file')
   },
 
@@ -352,21 +352,6 @@ const api = {
     error?: string
   }> => {
     return ipcRenderer.invoke('poll-iam-sso-auth', region || 'us-east-1')
-  },
-
-  // 完成 IAM SSO 登录 (用授权码换取 token)
-  completeIamSsoLogin: (code: string): Promise<{
-    success: boolean
-    completed?: boolean
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('complete-iam-sso-login', code)
   },
 
   // 取消 IAM SSO 登录

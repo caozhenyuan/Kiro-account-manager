@@ -1,7 +1,7 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
-import { join } from 'path'
+import { join, resolve, relative, isAbsolute, sep } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
 import { encode, decode } from 'cbor-x'
@@ -160,7 +160,7 @@ function getNetworkAgent(): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      const agent = safeCreateProxyAgent(proxyUrl, { insecureTls: true })
       if (agent) return agent
     }
   }
@@ -560,7 +560,7 @@ function initProxyServer(): ProxyServer {
 }
 
 // ============ 隐私模式打开浏览器 ============
-import { exec, execSync } from 'child_process'
+import { exec, execFile, execSync } from 'child_process'
 
 // 获取 Windows 默认浏览器
 function getWindowsDefaultBrowser(): string {
@@ -583,88 +583,115 @@ function getWindowsDefaultBrowser(): string {
   }
 }
 
+// Kiro IDE 用户设置路径（VS Code 系：Windows 在 %APPDATA%，macOS 在 Application Support，Linux 在 ~/.config）
+function getKiroSettingsFilePath(): string {
+  const home = app.getPath('home')
+  if (process.platform === 'win32') {
+    return join(process.env.APPDATA || join(home, 'AppData', 'Roaming'), 'Kiro', 'User', 'settings.json')
+  }
+  if (process.platform === 'darwin') {
+    return join(home, 'Library', 'Application Support', 'Kiro', 'User', 'settings.json')
+  }
+  return join(process.env.XDG_CONFIG_HOME || join(home, '.config'), 'Kiro', 'User', 'settings.json')
+}
+
+// steering 文件的绝对路径；文件名含路径分隔符或 .. 时返回 null，防止逃出 ~/.kiro/steering
+function resolveSteeringFile(filename: unknown): string | null {
+  if (typeof filename !== 'string' || !filename || filename.includes('\0')) return null
+  const steeringDir = join(app.getPath('home'), '.kiro', 'steering')
+  const resolved = resolve(steeringDir, filename)
+  const rel = relative(steeringDir, resolved)
+  if (!rel || rel.startsWith('..') || isAbsolute(rel) || rel.includes(sep)) return null
+  return resolved
+}
+
+// 仅放行 http(s) URL，返回规范化后的 href（引号、空格等已被百分号编码）
+function toSafeBrowserUrl(url: unknown): string | null {
+  if (typeof url !== 'string') return null
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+    return u.href.includes('"') ? null : u.href
+  } catch {
+    return null
+  }
+}
+
+// 依次尝试候选命令，全部失败后回退系统默认浏览器（非隐私模式）
+function runBrowserCandidates(
+  candidates: Array<{ file: string; args: string[] }>,
+  fallbackUrl: string
+): void {
+  const [current, ...rest] = candidates
+  if (!current) {
+    console.log('[Browser] Fallback to default browser (non-private)')
+    shell.openExternal(fallbackUrl)
+    return
+  }
+  execFile(current.file, current.args, (err) => {
+    if (err) runBrowserCandidates(rest, fallbackUrl)
+  })
+}
+
 // 使用隐私模式打开浏览器
-function openBrowserInPrivateMode(url: string): void {
+function openBrowserInPrivateMode(rawUrl: string): void {
+  const url = toSafeBrowserUrl(rawUrl)
+  if (!url) {
+    console.warn('[Browser] Refused to open non-http(s) URL')
+    return
+  }
   const platform = process.platform
   console.log(`[Browser] Opening in private mode on ${platform}: ${url}`)
 
   try {
     if (platform === 'win32') {
-      // Windows: 检测默认浏览器并使用对应的隐私模式参数
+      // Windows: start 是 cmd 内建命令，只能经 shell。URL 经环境变量传入，
+      // cmd 只做一次变量展开，值里的 % & 等不会被再次解析
       const defaultBrowser = getWindowsDefaultBrowser()
       console.log(`[Browser] Detected default browser: ${defaultBrowser}`)
-      
-      let command = ''
-      switch (defaultBrowser) {
-        case 'chrome':
-          command = `start chrome --incognito "${url}"`
-          break
-        case 'msedge':
-          command = `start msedge -inprivate "${url}"`
-          break
-        case 'firefox':
-          command = `start firefox -private-window "${url}"`
-          break
-        case 'brave':
-          command = `start brave --incognito "${url}"`
-          break
-        case 'opera':
-          command = `start opera --private "${url}"`
-          break
-        default:
-          // 未知浏览器，尝试常见浏览器
-          console.log('[Browser] Unknown default browser, trying common browsers...')
-          exec(`start chrome --incognito "${url}"`, (err) => {
-            if (err) {
-              exec(`start msedge -inprivate "${url}"`, (err2) => {
-                if (err2) {
-                  exec(`start firefox -private-window "${url}"`, (err3) => {
-                    if (err3) {
-                      console.log('[Browser] Fallback to default browser (non-private)')
-                      shell.openExternal(url)
-                    }
-                  })
-                }
-              })
-            }
-          })
-          return
+
+      const startCommands: Record<string, string> = {
+        chrome: 'start "" chrome --incognito "%KIRO_OPEN_URL%"',
+        msedge: 'start "" msedge -inprivate "%KIRO_OPEN_URL%"',
+        firefox: 'start "" firefox -private-window "%KIRO_OPEN_URL%"',
+        brave: 'start "" brave --incognito "%KIRO_OPEN_URL%"',
+        opera: 'start "" opera --private "%KIRO_OPEN_URL%"'
       }
-      
-      exec(command, (err) => {
-        if (err) {
-          console.log(`[Browser] Failed to open ${defaultBrowser}, fallback to default`)
+      const commands =
+        defaultBrowser in startCommands
+          ? [startCommands[defaultBrowser]]
+          : [startCommands.chrome, startCommands.msedge, startCommands.firefox]
+
+      const tryNext = (index: number): void => {
+        if (index >= commands.length) {
+          console.log('[Browser] Fallback to default browser (non-private)')
           shell.openExternal(url)
+          return
         }
-      })
+        exec(commands[index], { env: { ...process.env, KIRO_OPEN_URL: url } }, (err) => {
+          if (err) tryNext(index + 1)
+        })
+      }
+      tryNext(0)
     } else if (platform === 'darwin') {
       // macOS: 尝试 Chrome -> Firefox -> 默认浏览器
-      exec(`open -na "Google Chrome" --args --incognito "${url}"`, (err) => {
-        if (err) {
-          exec(`open -a Firefox --args -private-window "${url}"`, (err2) => {
-            if (err2) {
-              console.log('[Browser] Fallback to default browser')
-              shell.openExternal(url)
-            }
-          })
-        }
-      })
+      runBrowserCandidates(
+        [
+          { file: 'open', args: ['-na', 'Google Chrome', '--args', '--incognito', url] },
+          { file: 'open', args: ['-a', 'Firefox', '--args', '-private-window', url] }
+        ],
+        url
+      )
     } else {
       // Linux: 尝试 Chrome -> Chromium -> Firefox
-      exec(`google-chrome --incognito "${url}"`, (err) => {
-        if (err) {
-          exec(`chromium --incognito "${url}"`, (err2) => {
-            if (err2) {
-              exec(`firefox -private-window "${url}"`, (err3) => {
-                if (err3) {
-                  console.log('[Browser] Fallback to default browser')
-                  shell.openExternal(url)
-                }
-              })
-            }
-          })
-        }
-      })
+      runBrowserCandidates(
+        [
+          { file: 'google-chrome', args: ['--incognito', url] },
+          { file: 'chromium', args: ['--incognito', url] },
+          { file: 'firefox', args: ['-private-window', url] }
+        ],
+        url
+      )
     }
   } catch (error) {
     console.error('[Browser] Error opening in private mode:', error)
@@ -1572,6 +1599,35 @@ function startKiroAuthTokenWatcher(): void {
   console.log('[KiroAuthSync] Watching:', KIRO_AUTH_TOKEN_PATH)
 }
 
+/**
+ * 只更新某个账号的 credentials 并写回：写入前重新读取最新的 store 数据再合并，
+ * 避免用 await 之前读到的旧快照整库覆盖渲染端期间保存的修改；
+ * 同步更新 lastSavedData，使退出时的落盘不会把这次更新回滚。
+ */
+function patchAccountCredentials(accountId: string, patch: Record<string, unknown>): boolean {
+  if (!store) return false
+  const latest = store.get('accountData') as
+    | { accounts?: Record<string, { credentials?: Record<string, unknown> }> }
+    | null
+    | undefined
+  const target = latest?.accounts?.[accountId]
+  if (!latest?.accounts || !target) return false
+  latest.accounts[accountId] = { ...target, credentials: { ...target.credentials, ...patch } }
+  store.set('accountData', latest)
+
+  if (lastSavedData && typeof lastSavedData === 'object') {
+    const snapshot = lastSavedData as { accounts?: Record<string, { credentials?: Record<string, unknown> }> }
+    const snapshotAccount = snapshot.accounts?.[accountId]
+    if (snapshotAccount) {
+      snapshot.accounts![accountId] = {
+        ...snapshotAccount,
+        credentials: { ...snapshotAccount.credentials, ...patch }
+      }
+    }
+  }
+  return true
+}
+
 async function syncIdeTokenChangeToStore(token: {
   accessToken: string
   refreshToken: string
@@ -1648,14 +1704,12 @@ async function syncIdeTokenChangeToStore(token: {
 
   const accountToUpdate = accountData.accounts[matchedId]
   if (!accountToUpdate) return
-  accountToUpdate.credentials = {
-    ...accountToUpdate.credentials,
+  const patched = patchAccountCredentials(matchedId, {
     accessToken: token.accessToken,
     refreshToken: token.refreshToken,
     expiresAt: Date.parse(token.expiresAt) || Date.now() + 3600 * 1000
-  }
-
-  store!.set('accountData', accountData)
+  })
+  if (!patched) return
   console.log(
     `[KiroAuthSync] Synced IDE-refreshed token back to account ${accountToUpdate.email || matchedId} (${matchedReason})`
   )
@@ -1792,15 +1846,11 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
   }
 
   // 2. 写 store（同步反代/UI）
-  if (store) {
-    account.credentials = {
-      ...creds,
-      accessToken: newAccess,
-      refreshToken: newRefresh,
-      expiresAt: newExpiresAt
-    }
-    store.set('accountData', accountData)
-  }
+  patchAccountCredentials(accountId, {
+    accessToken: newAccess,
+    refreshToken: newRefresh,
+    expiresAt: newExpiresAt
+  })
 
   // 3. 通知 renderer reload
   try {
@@ -2070,6 +2120,35 @@ function markAccountNeedsRelogin(accountId: string, error?: string, deadRefreshT
   }
 }
 
+/**
+ * 把后台刷新得到的 token 写回主进程持有的账号快照并落盘。
+ * 窗口关闭（macOS 常驻托盘）时没有渲染进程接收 background-refresh-result，
+ * 服务端若轮换了 refreshToken，不落盘下一轮会用旧 token 触发 invalid_grant。
+ */
+function persistRefreshedTokenToSnapshot(
+  accountId: string,
+  tokens: { accessToken?: string; refreshToken?: string; expiresIn?: number }
+): void {
+  if (!lastSavedData || typeof lastSavedData !== 'object') return
+  const data = lastSavedData as { accounts?: Record<string, Record<string, unknown>> }
+  const account = data.accounts?.[accountId] as { credentials?: Record<string, unknown> } | undefined
+  if (!account?.credentials) return
+  data.accounts![accountId] = {
+    ...account,
+    credentials: {
+      ...account.credentials,
+      ...(tokens.accessToken ? { accessToken: tokens.accessToken } : {}),
+      ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+      ...(tokens.expiresIn ? { expiresAt: Date.now() + tokens.expiresIn * 1000 } : {})
+    }
+  }
+  try {
+    store?.set('accountData', lastSavedData)
+  } catch (e) {
+    console.warn('[BackgroundRefresh] Failed to persist refreshed token:', e)
+  }
+}
+
 /** 刷新提前量：≥ 2× 检查间隔且不少于 10 分钟，确保 token 不会在两次 tick 之间过期。 */
 function mainTokenRefreshLeadMs(intervalMin: number): number {
   return Math.max(intervalMin * 2 * 60 * 1000, 10 * 60 * 1000)
@@ -2175,6 +2254,7 @@ function stopMainPoolTokenRefresh(): void {
 // ============ 托盘相关变量 ============
 let traySettings: TraySettings = { ...defaultTraySettings }
 let isQuitting = false // 标记是否真正退出应用
+let exitFlushStarted = false // will-quit 落盘流程已开始，防止重入
 
 // ============ 全局快捷键设置 ============
 let showWindowShortcut = process.platform === 'darwin' ? 'Command+Shift+K' : 'Ctrl+Shift+K'
@@ -2203,12 +2283,12 @@ async function saveShortcutSettings(): Promise<void> {
 }
 
 // 注册显示主窗口的快捷键
-function registerShowWindowShortcut(): void {
+function registerShowWindowShortcut(): boolean {
   // 先注销所有已注册的快捷键
   globalShortcut.unregisterAll()
-  
-  if (!showWindowShortcut) return
-  
+
+  if (!showWindowShortcut) return true
+
   try {
     const success = globalShortcut.register(showWindowShortcut, () => {
       if (mainWindow) {
@@ -2226,8 +2306,10 @@ function registerShowWindowShortcut(): void {
     } else {
       console.warn(`[Shortcut] Failed to register: ${showWindowShortcut}`)
     }
+    return success
   } catch (error) {
     console.error('[Shortcut] Error registering shortcut:', error)
+    return false
   }
 }
 let currentProxyAccount: { id: string; email: string; idp: string; status: string; subscription?: string; usage?: { usedCredits: number; totalCredits: number; totalRequests: number; successRequests: number; failedRequests: number } } | null = null
@@ -2295,9 +2377,12 @@ function initTray(): void {
     },
     getProxyStatus: () => {
       const server = initProxyServer()
+      const cfg = server.getConfig()
       return {
         running: server.isRunning(),
-        port: server.getConfig().port
+        port: cfg.port,
+        host: cfg.host,
+        https: !!cfg.tls?.enabled
       }
     },
     getCurrentAccount: () => currentProxyAccount,
@@ -2680,11 +2765,12 @@ app.whenReady().then(async () => {
 
   // IPC: 打开外部链接
   ipcMain.on('open-external', (_event, url: string, usePrivateMode?: boolean) => {
-    if (typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'))) {
+    const safeUrl = toSafeBrowserUrl(url)
+    if (safeUrl) {
       if (usePrivateMode) {
-        openBrowserInPrivateMode(url)
+        openBrowserInPrivateMode(safeUrl)
       } else {
-        shell.openExternal(url)
+        shell.openExternal(safeUrl)
       }
     }
   })
@@ -2718,9 +2804,15 @@ app.whenReady().then(async () => {
   // IPC: 设置显示主窗口快捷键
   ipcMain.handle('set-show-window-shortcut', async (_event, shortcut: string) => {
     try {
+      const previous = showWindowShortcut
       showWindowShortcut = shortcut
+      if (!registerShowWindowShortcut()) {
+        // 新快捷键无效或被占用：恢复旧快捷键，且不持久化
+        showWindowShortcut = previous
+        registerShowWindowShortcut()
+        return { success: false, error: `快捷键 ${shortcut} 无法注册（格式无效或已被其它程序占用）` }
+      }
       await saveShortcutSettings()
-      registerShowWindowShortcut()
       return { success: true }
     } catch (error) {
       return { success: false, error: String(error) }
@@ -4253,6 +4345,14 @@ app.whenReady().then(async () => {
             success++
             completed++
 
+            if (account.id && !mainWindow) {
+              persistRefreshedTokenToSnapshot(account.id, {
+                accessToken: newAccessToken,
+                refreshToken: newRefreshToken,
+                expiresIn: newExpiresIn
+              })
+            }
+
             // 通知渲染进程更新账号
             mainWindow?.webContents.send('background-refresh-result', {
               id: account.id,
@@ -5006,27 +5106,32 @@ app.whenReady().then(async () => {
         const clientContent = await readFile(clientRegPath, 'utf-8')
         clientData = JSON.parse(clientContent)
       } catch {
-        // 如果找不到，尝试搜索目录中的其他 .json 文件（排除 kiro-auth-token.json）
-        console.log('[Kiro Credentials] Client file not found, searching cache directory...')
-        try {
-          const files = await fs.readdir(ssoCache)
-          for (const file of files) {
-            if (file.endsWith('.json') && file !== 'kiro-auth-token.json') {
-              try {
-                const content = await readFile(path.join(ssoCache, file), 'utf-8')
-                const data = JSON.parse(content)
-                if (data.clientId && data.clientSecret) {
-                  clientData = data
-                  console.log('[Kiro Credentials] Found client registration in:', file)
-                  break
+        // token 里没有 clientIdHash 时才回退到默认 hash；有 hash 却找不到文件，说明注册文件缺失，
+        // 不去抓目录里别的工具（如 AWS CLI）的客户端注册，避免拿到不属于 Kiro 的 clientId
+        if (tokenData.clientIdHash) {
+          console.log('[Kiro Credentials] Client registration referenced by clientIdHash not found')
+        } else {
+          console.log('[Kiro Credentials] Client file not found, searching cache directory...')
+          try {
+            const files = await fs.readdir(ssoCache)
+            for (const file of files) {
+              if (file.endsWith('.json') && file !== 'kiro-auth-token.json') {
+                try {
+                  const content = await readFile(path.join(ssoCache, file), 'utf-8')
+                  const data = JSON.parse(content)
+                  if (data.clientId && data.clientSecret) {
+                    clientData = data
+                    console.log('[Kiro Credentials] Found client registration in:', file)
+                    break
+                  }
+                } catch {
+                  // 忽略无法解析的文件
                 }
-              } catch {
-                // 忽略无法解析的文件
               }
             }
+          } catch {
+            // 忽略目录读取错误
           }
-        } catch {
-          // 忽略目录读取错误
         }
       }
       
@@ -5188,7 +5293,6 @@ app.whenReady().then(async () => {
 
     try {
       const {
-        refreshToken,
         clientId,
         clientSecret,
         region = 'us-east-1',
@@ -5196,7 +5300,9 @@ app.whenReady().then(async () => {
         provider,
         scopes
       } = credentials
-      let { accessToken } = credentials
+      let { accessToken, refreshToken } = credentials
+      let expiresInSec = 3600
+      let refreshedCredentials: { accessToken: string; refreshToken: string; expiresIn: number } | undefined
 
       // 切号前先刷新 token（和 IDE 切号一致）
       if (refreshToken) {
@@ -5205,6 +5311,10 @@ app.whenReady().then(async () => {
         const refreshResult = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region, authMethod)
         if (refreshResult.success && refreshResult.accessToken) {
           accessToken = refreshResult.accessToken
+          // 服务端可能轮换 refreshToken：写入 CLI 库和回传渲染进程的都必须是新值
+          refreshToken = refreshResult.refreshToken || refreshToken
+          expiresInSec = refreshResult.expiresIn || expiresInSec
+          refreshedCredentials = { accessToken, refreshToken, expiresIn: expiresInSec }
           console.log('[Switch CLI] Token refreshed successfully')
         } else {
           console.warn(`[Switch CLI] Token refresh failed: ${refreshResult.error}, using existing token`)
@@ -5235,7 +5345,7 @@ app.whenReady().then(async () => {
       })
 
       // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
-      const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString()
+      const expiresAt = new Date(Date.now() + expiresInSec * 1000).toISOString()
       const tokenData: Record<string, unknown> = {
         access_token: accessToken,
         refresh_token: refreshToken,
@@ -5300,7 +5410,7 @@ app.whenReady().then(async () => {
 
       console.log(`[Switch CLI] Token saved to SQLite key: ${preferredTokenKey}`)
       console.log(`[Switch CLI] Account switched successfully in ${dbPath}`)
-      return { success: true, dbPath }
+      return { success: true, dbPath, refreshedCredentials }
     } catch (error) {
       console.error('[Switch CLI] Error:', error)
       return { success: false, error: error instanceof Error ? error.message : 'CLI 切换失败' }
@@ -5312,7 +5422,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('logout-account', async () => {
     const os = await import('os')
     const path = await import('path')
-    const { readdir, unlink } = await import('fs/promises')
+    const { unlink } = await import('fs/promises')
 
     // 立刻清掉主动续期 timer 和"激活账号"记忆，避免 watcher / timer 误同步
     clearProactiveRenewal('logout-account')
@@ -5321,21 +5431,35 @@ app.whenReady().then(async () => {
 
     try {
       const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
-      console.log('[Logout] Clearing SSO cache:', ssoCache)
-      
-      // 读取目录下所有文件
-      const files = await readdir(ssoCache).catch(() => [])
-      
-      // 删除所有文件
-      for (const file of files) {
-        const filePath = path.join(ssoCache, file)
-        await unlink(filePath).catch((e) => {
-          console.warn('[Logout] Failed to delete file:', filePath, e)
-        })
+      console.log('[Logout] Clearing Kiro SSO cache in:', ssoCache)
+
+      // 只清 Kiro 自己的登录态：token 文件及其引用的客户端注册文件。
+      // 目录里还可能有 AWS CLI 等其它工具的缓存，不能整目录删除。
+      const tokenFile = path.join(ssoCache, 'kiro-auth-token.json')
+      const targets = [tokenFile]
+      try {
+        const tokenData = JSON.parse(await readFile(tokenFile, 'utf-8')) as { clientIdHash?: string }
+        if (tokenData.clientIdHash && /^[a-f0-9]+$/i.test(tokenData.clientIdHash)) {
+          targets.push(path.join(ssoCache, `${tokenData.clientIdHash}.json`))
+        }
+      } catch {
+        // token 文件不存在或损坏：没有可关联的注册文件
       }
-      
-      console.log('[Logout] SSO cache cleared, deleted', files.length, 'files')
-      return { success: true, deletedCount: files.length }
+
+      let deleted = 0
+      for (const filePath of targets) {
+        try {
+          await unlink(filePath)
+          deleted++
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+            console.warn('[Logout] Failed to delete file:', filePath, e)
+          }
+        }
+      }
+
+      console.log('[Logout] SSO cache cleared, deleted', deleted, 'files')
+      return { success: true, deletedCount: deleted }
     } catch (error) {
       console.error('[Logout] Error:', error)
       return { success: false, error: error instanceof Error ? error.message : '退出失败' }
@@ -5943,7 +6067,7 @@ app.whenReady().then(async () => {
       const path = await import('path')
       
       const homeDir = os.homedir()
-      const kiroSettingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
+      const kiroSettingsPath = getKiroSettingsFilePath()
       const kiroSteeringPath = path.join(homeDir, '.kiro', 'steering')
       const kiroMcpUserPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
       
@@ -6048,12 +6172,10 @@ app.whenReady().then(async () => {
   // IPC: 保存 Kiro 设置
   ipcMain.handle('save-kiro-settings', async (_event, settings: Record<string, unknown>) => {
     try {
-      const os = await import('os')
       const fs = await import('fs')
       const path = await import('path')
       
-      const homeDir = os.homedir()
-      const kiroSettingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
+      const kiroSettingsPath = getKiroSettingsFilePath()
       
       let existingSettings = {}
       if (fs.existsSync(kiroSettingsPath)) {
@@ -6067,8 +6189,7 @@ app.whenReady().then(async () => {
       }
       
       // 映射设置到 Kiro 的格式
-      const kiroSettings = {
-        ...existingSettings,
+      const mappedSettings: Record<string, unknown> = {
         'kiroAgent.modelSelection': settings.modelSelection,
         'kiroAgent.agentAutonomy': settings.agentAutonomy,
         'kiroAgent.enableDebugLogs': settings.enableDebugLogs,
@@ -6087,13 +6208,22 @@ app.whenReady().then(async () => {
         'kiroAgent.notifications.agent.success': settings.notificationsSuccess,
         'kiroAgent.notifications.billing': settings.notificationsBilling
       }
-      
+      // undefined 字段不覆盖原有值（否则 JSON 序列化时该键会直接消失）
+      const kiroSettings: Record<string, unknown> = { ...existingSettings }
+      for (const [key, value] of Object.entries(mappedSettings)) {
+        if (value !== undefined) kiroSettings[key] = value
+      }
+
       // 确保目录存在
       const dir = path.dirname(kiroSettingsPath)
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true })
       }
       
+      // 整文件重写会丢失用户在 settings.json 里手写的注释，先留一份原文件备份
+      if (fs.existsSync(kiroSettingsPath)) {
+        fs.copyFileSync(kiroSettingsPath, `${kiroSettingsPath}.kam-backup`)
+      }
       fs.writeFileSync(kiroSettingsPath, JSON.stringify(kiroSettings, null, 4))
       return { success: true }
     } catch (error) {
@@ -6160,11 +6290,9 @@ app.whenReady().then(async () => {
   // IPC: 打开 Kiro settings.json 文件
   ipcMain.handle('open-kiro-settings-file', async () => {
     try {
-      const os = await import('os')
       const path = await import('path')
       const fs = await import('fs')
-      const homeDir = os.homedir()
-      const settingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
+      const settingsPath = getKiroSettingsFilePath()
       
       // 如果文件不存在，创建默认配置
       if (!fs.existsSync(settingsPath)) {
@@ -6190,10 +6318,8 @@ app.whenReady().then(async () => {
   // IPC: 打开指定的 Steering 文件
   ipcMain.handle('open-kiro-steering-file', async (_event, filename: string) => {
     try {
-      const os = await import('os')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
+      const filePath = resolveSteeringFile(filename)
+      if (!filePath) return { success: false, error: '非法的文件名' }
       
       shell.openPath(filePath)
       return { success: true }
@@ -6289,11 +6415,9 @@ app.whenReady().then(async () => {
   // IPC: 读取 Steering 文件内容
   ipcMain.handle('read-kiro-steering-file', async (_event, filename: string) => {
     try {
-      const os = await import('os')
       const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
+      const filePath = resolveSteeringFile(filename)
+      if (!filePath) return { success: false, error: '非法的文件名' }
       
       if (!fs.existsSync(filePath)) {
         return { success: false, error: '文件不存在' }
@@ -6315,7 +6439,8 @@ app.whenReady().then(async () => {
       const path = await import('path')
       const homeDir = os.homedir()
       const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      const filePath = path.join(steeringPath, filename)
+      const filePath = resolveSteeringFile(filename)
+      if (!filePath) return { success: false, error: '非法的文件名' }
       
       // 确保目录存在
       if (!fs.existsSync(steeringPath)) {
@@ -6904,6 +7029,7 @@ app.whenReady().then(async () => {
   // IPC: 在系统默认浏览器无痕模式中打开订阅链接
   ipcMain.handle('open-subscription-window', async (_event, url: string) => {
     try {
+      if (!toSafeBrowserUrl(url)) return { success: false, error: 'Invalid URL' }
       openBrowserInPrivateMode(url)
       return { success: true }
     } catch (error) {
@@ -7062,6 +7188,19 @@ app.whenReady().then(async () => {
     }
   })
 
+  // 渲染进程只需要展示信息，不返回 CA 私钥与证书 PEM
+  const toPublicCaInfo = (
+    info: ReturnType<NonNullable<ReturnType<typeof getKProxyService>>['getCACertInfo']>
+  ): { certPath: string; fingerprint: string; validFrom: string; validTo: string } | null =>
+    info
+      ? {
+          certPath: info.certPath,
+          fingerprint: info.fingerprint,
+          validFrom: info.validFrom.toISOString(),
+          validTo: info.validTo.toISOString()
+        }
+      : null
+
   // IPC: 获取 K-Proxy 状态
   ipcMain.handle('kproxy-get-status', () => {
     const service = getKProxyService()
@@ -7073,7 +7212,7 @@ app.whenReady().then(async () => {
       running: service.isRunning(),
       config: service.getConfig(),
       stats: service.getStats(),
-      caInfo: service.getCACertInfo()
+      caInfo: toPublicCaInfo(service.getCACertInfo())
     }
   })
 
@@ -7292,11 +7431,21 @@ app.whenReady().then(async () => {
         execSync(`security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db "${caInfo.certPath}"`)
         return { success: true, message: 'CA certificate installed to macOS Keychain' }
       } else {
-        // Linux: 复制到系统 CA 目录
-        const fs = await import('fs')
+        // Linux: 复制到系统 CA 目录并更新。目录需要 root 权限，GUI 进程没有 TTY，
+        // 用 pkexec 弹出图形授权，复制与更新放在同一次提权里
+        const { execFileSync } = await import('child_process')
         const targetPath = '/usr/local/share/ca-certificates/kproxy-ca.crt'
-        fs.copyFileSync(caInfo.certPath, targetPath)
-        execSync('sudo update-ca-certificates')
+        try {
+          execFileSync('pkexec', ['sh', '-c', 'cp "$1" "$2" && update-ca-certificates', 'sh', caInfo.certPath, targetPath], {
+            encoding: 'utf-8'
+          })
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          if (code === 'ENOENT') {
+            throw new Error(`未找到 pkexec，请在终端手动执行：sudo cp "${caInfo.certPath}" ${targetPath} && sudo update-ca-certificates`)
+          }
+          throw error
+        }
         return { success: true, message: 'CA certificate installed to Linux CA store' }
       }
     } catch (error) {
@@ -7328,12 +7477,22 @@ app.whenReady().then(async () => {
         execSync('security delete-certificate -c "K-Proxy CA" ~/Library/Keychains/login.keychain-db')
         return { success: true, message: 'CA certificate removed from macOS Keychain' }
       } else {
-        // Linux: 删除证书并更新
+        // Linux: 删除证书并更新（同样经 pkexec 图形授权）
         const fs = await import('fs')
+        const { execFileSync } = await import('child_process')
         const targetPath = '/usr/local/share/ca-certificates/kproxy-ca.crt'
         if (fs.existsSync(targetPath)) {
-          fs.unlinkSync(targetPath)
-          execSync('sudo update-ca-certificates --fresh')
+          try {
+            execFileSync('pkexec', ['sh', '-c', 'rm -f "$1" && update-ca-certificates --fresh', 'sh', targetPath], {
+              encoding: 'utf-8'
+            })
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code
+            if (code === 'ENOENT') {
+              throw new Error(`未找到 pkexec，请在终端手动执行：sudo rm ${targetPath} && sudo update-ca-certificates --fresh`)
+            }
+            throw error
+          }
         }
         return { success: true, message: 'CA certificate removed from Linux CA store' }
       }
@@ -7417,11 +7576,9 @@ app.whenReady().then(async () => {
   // IPC: 删除 Steering 文件
   ipcMain.handle('delete-kiro-steering-file', async (_event, filename: string) => {
     try {
-      const os = await import('os')
       const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
+      const filePath = resolveSteeringFile(filename)
+      if (!filePath) return { success: false, error: '非法的文件名' }
       
       if (!fs.existsSync(filePath)) {
         return { success: false, error: '文件不存在' }
@@ -7614,14 +7771,15 @@ app.on('window-all-closed', () => {
 // 应用退出前注销 URI 协议处理器并保存数据
 app.on('will-quit', async (event) => {
   // 防止重复处理
-  if (isQuitting) return
-  
+  if (exitFlushStarted) return
+
   // 停止主进程池 token 刷新调度器
   stopMainPoolTokenRefresh()
 
   // 防止应用立即退出，先保存数据
   if (lastSavedData && store) {
     event.preventDefault()
+    exitFlushStarted = true
     isQuitting = true
     
     // 设置超时，确保 3 秒后强制退出（防止关机阻塞）
