@@ -22,6 +22,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { RegionMismatchNotice } from './RegionMismatchNotice'
+import { AccountErrorLine } from './AccountErrorLine'
 import {
   toRgba,
   generateRowGlowStyle,
@@ -201,8 +202,17 @@ function AccountListRowComponent({
       }
     }
     if (target === 'cli' || target === 'both') {
-      const result = await window.api.switchAccountCli(cliPayload)
+      // both 时 IDE 已刷新过 token，CLI 直接用最新凭证，避免同一个 refreshToken 被刷新两次
+      const latest = useAccountsStore.getState().accounts.get(account.id)?.credentials
+      const result = await window.api.switchAccountCli(
+        target === 'both' && latest
+          ? { ...cliPayload, accessToken: latest.accessToken, refreshToken: latest.refreshToken || cliPayload.refreshToken }
+          : cliPayload
+      )
       if (!result.success && target === 'cli') { success = false; errorMsg = result.error || '' }
+      if (result.success && result.refreshedCredentials) {
+        useAccountsStore.getState().applySwitchRefreshedCredentials(account.id, result.refreshedCredentials)
+      }
     }
 
     if (success) {
@@ -352,9 +362,11 @@ function AccountListRowComponent({
 
           {/* 错误信息（非封禁，因为封禁已用红色徽章显示） */}
           {account.lastError && !isUnauthorized && (
-            <span className="text-destructive truncate flex-1 min-w-0 italic" title={account.lastError}>
-              {account.lastError}
-            </span>
+            <AccountErrorLine
+              error={account.lastError}
+              isEn={isEn}
+              className="text-destructive italic flex-1"
+            />
           )}
 
           {/* 复制邮箱小图标 */}

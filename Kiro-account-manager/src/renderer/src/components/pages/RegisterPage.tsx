@@ -993,7 +993,7 @@ export function RegisterPage(): React.JSX.Element {
           ? {
               ...verifyResult.data.usage,
               percentUsed: verifyResult.data.usage.limit > 0
-                ? Math.round((verifyResult.data.usage.current / verifyResult.data.usage.limit) * 100)
+                ? verifyResult.data.usage.current / verifyResult.data.usage.limit
                 : 0,
               lastUpdated: now
             }
@@ -1451,7 +1451,7 @@ export function RegisterPage(): React.JSX.Element {
         },
         subscription: { type: subType, title: sub },
         usage: creditLimit > 0
-          ? { current: creditUsed, limit: creditLimit, percentUsed: Math.round((creditUsed / creditLimit) * 100), lastUpdated: now }
+          ? { current: creditUsed, limit: creditLimit, percentUsed: creditUsed / creditLimit, lastUpdated: now }
           : defaultUsage,
         tags: [],
         lastUsedAt: now
@@ -1473,7 +1473,7 @@ export function RegisterPage(): React.JSX.Element {
       if (verifyResult.success && verifyResult.data) {
         const expiresAt = verifyResult.data.expiresIn ? now + verifyResult.data.expiresIn * 1000 : now + 3600000
         const usage = verifyResult.data.usage
-          ? { ...verifyResult.data.usage, percentUsed: verifyResult.data.usage.limit > 0 ? Math.round((verifyResult.data.usage.current / verifyResult.data.usage.limit) * 100) : 0, lastUpdated: now }
+          ? { ...verifyResult.data.usage, percentUsed: verifyResult.data.usage.limit > 0 ? verifyResult.data.usage.current / verifyResult.data.usage.limit : 0, lastUpdated: now }
           : defaultUsage
         addAccount({
           email: verifyResult.data.email || regResult.email, password: regResult.password, idp: 'BuilderId', status: 'active',
@@ -2148,7 +2148,7 @@ export function RegisterPage(): React.JSX.Element {
       if (verifyResult.success && verifyResult.data) {
         const expiresAt = verifyResult.data.expiresIn ? now + verifyResult.data.expiresIn * 1000 : now + 3600000
         const usage = verifyResult.data.usage
-          ? { ...verifyResult.data.usage, percentUsed: verifyResult.data.usage.limit > 0 ? Math.round((verifyResult.data.usage.current / verifyResult.data.usage.limit) * 100) : 0, lastUpdated: now }
+          ? { ...verifyResult.data.usage, percentUsed: verifyResult.data.usage.limit > 0 ? verifyResult.data.usage.current / verifyResult.data.usage.limit : 0, lastUpdated: now }
           : defaultUsage
 
         addAccount({

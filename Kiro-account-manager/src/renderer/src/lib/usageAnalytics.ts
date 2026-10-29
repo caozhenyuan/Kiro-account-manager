@@ -91,6 +91,19 @@ export function dayKey(date: Date): string {
   return `${y}-${m}-${d}`
 }
 
+/** 月份加减，日期超出目标月天数时钳到该月最后一天（1-31 号 +1 月 不会溢出到下下月） */
+function addMonths(date: Date, delta: number): Date {
+  const firstOfTarget = new Date(date.getFullYear(), date.getMonth() + delta, 1)
+  const daysInTarget = new Date(firstOfTarget.getFullYear(), firstOfTarget.getMonth() + 1, 0).getDate()
+  return new Date(
+    firstOfTarget.getFullYear(),
+    firstOfTarget.getMonth(),
+    Math.min(date.getDate(), daysInTarget),
+    date.getHours(),
+    date.getMinutes()
+  )
+}
+
 /** 以 nextResetDate 倒推周期。重置日已过（数据陈旧）时顺延整月，避免出现负的剩余天数 */
 export function cycleOf(nextResetDate: string | undefined, now: Date): CycleInfo {
   const reset = nextResetDate ? new Date(nextResetDate) : null
@@ -111,21 +124,9 @@ export function cycleOf(nextResetDate: string | undefined, now: Date): CycleInfo
   // 陈旧的重置日：向后顺延整月直到落在未来
   let guard = 0
   while (end.getTime() <= now.getTime() && guard++ < 24) {
-    end = new Date(
-      end.getFullYear(),
-      end.getMonth() + 1,
-      end.getDate(),
-      end.getHours(),
-      end.getMinutes()
-    )
+    end = addMonths(end, 1)
   }
-  const start = new Date(
-    end.getFullYear(),
-    end.getMonth() - 1,
-    end.getDate(),
-    end.getHours(),
-    end.getMinutes()
-  )
+  const start = addMonths(end, -1)
   const total = Math.max(1, Math.round((end.getTime() - start.getTime()) / DAY_MS))
   const elapsed = Math.min(total, Math.max(0, (now.getTime() - start.getTime()) / DAY_MS))
   return {
@@ -145,7 +146,8 @@ export function cycleOf(nextResetDate: string | undefined, now: Date): CycleInfo
 export function buildTrend(
   history: UsageHistory,
   now: Date,
-  days = TREND_DAYS
+  days = TREND_DAYS,
+  includeAccountIds?: ReadonlySet<string>
 ): { trend: TrendPoint[]; resetCount: number } {
   const windowDays: string[] = []
   for (let i = days - 1; i >= 0; i--) {
@@ -164,6 +166,8 @@ export function buildTrend(
     let has = false
     for (const [rawId, snap] of Object.entries(history[key])) {
       const id = normalizeKey(rawId)
+      // 只统计仍在总额度里的账号：已删除/已封禁账号的历史消耗不应抬高日均与预测
+      if (includeAccountIds && !includeAccountIds.has(id.slice(0, Math.max(0, id.lastIndexOf('|'))))) continue
       const prev = lastSeen.get(id)
       lastSeen.set(id, snap.c)
       if (prev === undefined) continue
@@ -320,7 +324,7 @@ export function computeMonthlyAnalytics(
   const cycleElapsedDays = totalLimit > 0 ? elapsedWeighted / totalLimit : 0
   const cycleRemainingDays = totalLimit > 0 ? remainingWeighted / totalLimit : 0
 
-  const { trend, resetCount } = buildTrend(history, now)
+  const { trend, resetCount } = buildTrend(history, now, undefined, new Set(active.map((a) => a.id)))
   const withData = trend.filter((p) => p.hasData)
 
   // 日均：优先用最近 N 天真实消耗；样本不足（< 2 天）回退到"周期已用 ÷ 已过天数"

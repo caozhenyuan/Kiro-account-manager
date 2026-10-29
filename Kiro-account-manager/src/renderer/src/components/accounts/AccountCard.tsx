@@ -10,7 +10,6 @@ import {
   Trash2,
   Edit,
   Copy,
-  AlertTriangle,
   Clock,
   Loader2,
   Info,
@@ -28,6 +27,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { RegionMismatchNotice } from './RegionMismatchNotice'
+import { AccountErrorLine } from './AccountErrorLine'
 
 // 解析 ARGB 颜色转换为 CSS rgba
 function toRgba(argbColor: string): string {
@@ -277,8 +277,17 @@ export const AccountCard = memo(function AccountCard({
       }
     }
     if (switchTarget === 'cli' || switchTarget === 'both') {
-      const result = await window.api.switchAccountCli(cliPayload)
+      // both 时 IDE 已刷新过 token，CLI 直接用最新凭证，避免同一个 refreshToken 被刷新两次
+      const latest = useAccountsStore.getState().accounts.get(account.id)?.credentials
+      const result = await window.api.switchAccountCli(
+        switchTarget === 'both' && latest
+          ? { ...cliPayload, accessToken: latest.accessToken, refreshToken: latest.refreshToken || cliPayload.refreshToken }
+          : cliPayload
+      )
       if (!result.success && switchTarget === 'cli') { success = false; errorMsg = result.error || '' }
+      if (result.success && result.refreshedCredentials) {
+        useAccountsStore.getState().applySwitchRefreshedCredentials(account.id, result.refreshedCredentials)
+      }
     }
 
     if (success) {
@@ -872,10 +881,12 @@ export const AccountCard = memo(function AccountCard({
 
         {/* Error Message (Non-banned) */}
         {account.lastError && !isUnauthorized && (
-          <div className="bg-red-50 text-red-600 text-[10px] p-1.5 rounded flex items-center gap-1.5 truncate mt-1" title={account.lastError}>
-             <AlertTriangle className="h-3 w-3 shrink-0" />
-             <span className="truncate">{account.lastError}</span>
-          </div>
+          <AccountErrorLine
+            error={account.lastError}
+            isEn={isEn}
+            showIcon
+            className="bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400 text-[10px] p-1.5 rounded mt-1"
+          />
         )}
       </CardContent>
 

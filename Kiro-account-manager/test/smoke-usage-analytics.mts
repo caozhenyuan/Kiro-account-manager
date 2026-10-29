@@ -489,6 +489,45 @@ async function main(): Promise<void> {
     check('未归一旧键与新键连续差分', legacyTrend[1].used === 5, String(legacyTrend[1].used))
   }
 
+  console.log('[smoke] 月末重置日的周期推算')
+  {
+    // 重置日是 31 号、上个月只有 30 天：起点应钳到 30 号，周期约 30~31 天，而不是溢出到月初
+    const c = cycleOf(new Date(2026, 9, 31, 0, 0).toISOString(), new Date(2026, 9, 20, 12, 0))
+    check('周期总天数在 28~31 之间', c.totalDays >= 28 && c.totalDays <= 31, String(c.totalDays))
+    check('已过天数不超过总天数', c.elapsedDays <= c.totalDays, `${c.elapsedDays}/${c.totalDays}`)
+    // 2 月 28 日重置：向前倒推到 1 月 28 日
+    const feb = cycleOf(new Date(2027, 1, 28, 0, 0).toISOString(), new Date(2027, 1, 10, 12, 0))
+    check('2 月周期为 31 天', feb.totalDays === 31, String(feb.totalDays))
+    // 3 月 31 日重置：上一周期起点钳到 2 月 28 日，总天数 31
+    const mar = cycleOf(new Date(2027, 2, 31, 0, 0).toISOString(), new Date(2027, 2, 5, 12, 0))
+    check('3 月 31 日重置：总天数 31', mar.totalDays === 31, String(mar.totalDays))
+  }
+
+  console.log('[smoke] 趋势只统计仍计入总额度的账号')
+  {
+    const h: UsageHistory = {
+      '2026-10-18': { [k('live')]: snap(100), [k('gone')]: snap(500) },
+      '2026-10-19': { [k('live')]: snap(110), [k('gone')]: snap(900) },
+      '2026-10-20': { [k('live')]: snap(125), [k('gone')]: snap(1400) }
+    }
+    const all = buildTrend(h, NOW, 3).trend
+    check('不过滤时已删除账号的消耗被计入', all[2].used === 515, String(all[2].used))
+    const only = buildTrend(h, NOW, 3, new Set(['live'])).trend
+    check('只统计 live 账号：10-19 消耗 10', only[1].used === 10, String(only[1].used))
+    check('只统计 live 账号：10-20 消耗 15', only[2].used === 15, String(only[2].used))
+
+    const analytics = computeMonthlyAnalytics(
+      [account('live', { current: 125, limit: 1000, reset: '2026-11-01T00:00:00.000Z' })],
+      h,
+      NOW
+    )
+    check(
+      '日均不含已删除账号的消耗',
+      Math.abs(analytics.dailyAverage - 12.5) < 0.01,
+      String(analytics.dailyAverage)
+    )
+  }
+
   console.log('[smoke] 历史存储落盘与恢复')
   {
     const dir = await fs.mkdtemp(join(tmpdir(), 'kam-usage-'))

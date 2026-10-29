@@ -138,6 +138,46 @@ async function syncLocalSsoAccountAsync(
     })
     if (!verifyResult.success || !verifyResult.data) return
 
+    // refreshToken 被服务端轮换后按 token 匹配不到，但库里可能已有同一个人的账号：
+    // 按 userId 或 邮箱+provider 找到就更新它的凭证，不再每次启动多导入一个重复账号
+    const importProvider = importResult.data.provider || 'BuilderId'
+    let existingId: string | null = null
+    for (const [id, acc] of get().accounts) {
+      const sameUser = !!verifyResult.data.userId && acc.userId === verifyResult.data.userId
+      const sameEmail = acc.email === verifyResult.data.email && (acc.credentials.provider || acc.idp) === importProvider
+      if (sameUser || sameEmail) {
+        existingId = id
+        break
+      }
+    }
+    if (existingId) {
+      const matchedId = existingId
+      set((state) => {
+        const accounts = new Map(state.accounts)
+        const acc = accounts.get(matchedId)
+        if (!acc) return {}
+        for (const [id, other] of accounts) {
+          const shouldBeActive = id === matchedId
+          if (other.isActive !== shouldBeActive) accounts.set(id, { ...other, isActive: shouldBeActive })
+        }
+        accounts.set(matchedId, {
+          ...(accounts.get(matchedId) as Account),
+          credentials: {
+            ...acc.credentials,
+            accessToken: verifyResult.data!.accessToken,
+            refreshToken: verifyResult.data!.refreshToken,
+            expiresAt: verifyResult.data!.expiresIn
+              ? Date.now() + verifyResult.data!.expiresIn * 1000
+              : acc.credentials.expiresAt
+          }
+        })
+        return { accounts, activeAccountId: matchedId }
+      })
+      console.log('[Store] Local SSO account matched existing account by identity, credentials updated:', matchedId)
+      get().saveToStorage()
+      return
+    }
+
     const now = Date.now()
     const newId = `${verifyResult.data.email}-${now}`
     const newAccount: Account = {
@@ -472,6 +512,8 @@ interface AccountsActions {
   handleBackgroundCheckResult: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void
   /** 批量处理后台刷新结果：一次 set 应用 N 条结果，消除 N 次 Map 全量复制 */
   applyBackgroundRefreshResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
+  /** 切号时主进程刷新出的新凭证回写到账号并落盘（服务端可能轮换 refreshToken） */
+  applySwitchRefreshedCredentials: (accountId: string, rc: { accessToken: string; refreshToken: string; expiresIn: number }) => void
   /** 批量处理后台检查结果：一次 set 应用 N 条结果 */
   applyBackgroundCheckResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
 
@@ -1170,6 +1212,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const id = uuidv4()
         const machineId = generateRandomMachineId()
 
+        const idp = normalizeIdp(item.idp as string)
+        const hasOidcClient = !!(item.clientId && item.clientSecret)
+        const authMethod: 'IdC' | 'social' = hasOidcClient || idp === 'BuilderId' ? 'IdC' : 'social'
+
         const account: Account = {
           id,
           createdAt: now,
@@ -1178,7 +1224,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           email: item.email,
           password: item.password,
           nickname: item.nickname,
-          idp: normalizeIdp(item.idp as string),
+          idp,
           credentials: {
             accessToken: item.accessToken || '',
             csrfToken: item.csrfToken || '',
@@ -1186,7 +1232,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             clientId: item.clientId,
             clientSecret: item.clientSecret,
             region: item.region || 'us-east-1',
-            expiresAt: now + 3600 * 1000
+            expiresAt: now + 3600 * 1000,
+            authMethod,
+            provider: idp === 'BuilderId' || idp === 'Github' || idp === 'Google' ? idp : undefined
           },
           subscription: {
             type: 'Free'
@@ -1245,19 +1293,23 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
     
     // 去重：文件内部去重
-    const seenEmails = new Set<string>()
+    // 与库内去重口径一致：同邮箱但登录方式不同的账号不算重复
+    const seenIdentities = new Set<string>()
     const seenUserIds = new Set<string>()
+    let skippedInFile = 0
     const uniqueAccounts = data.accounts.filter(acc => {
-      if (seenEmails.has(acc.email) || (acc.userId && seenUserIds.has(acc.userId))) {
+      const identity = `${acc.email}|${acc.credentials?.provider || acc.idp || ''}`
+      if (seenIdentities.has(identity) || (acc.userId && seenUserIds.has(acc.userId))) {
+        skippedInFile++
         return false
       }
-      seenEmails.add(acc.email)
+      seenIdentities.add(identity)
       if (acc.userId) seenUserIds.add(acc.userId)
       return true
     })
 
     // 收集所有变更，一次性 set，避免 N 次 new Map（O(n²)）
-    let skipped = 0
+    let skipped = skippedInFile
     const accountsToAdd: Account[] = []
 
     for (const accountData of uniqueAccounts) {
@@ -1321,7 +1373,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         accounts.set(id, {
           ...account,
           status,
-          lastError: error,
+          // 'refreshing' 只是过渡状态：保留上一次的错误，否则后续结果更新时 wasBanned 恒为 false，
+          // 已封禁账号每次检查都会重复触发 account-banned webhook
+          lastError: status === 'refreshing' ? account.lastError : error,
           lastCheckedAt: Date.now()
         })
       }
@@ -1691,6 +1745,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   // ==================== 持久化 ====================
 
   loadFromStorage: async () => {
+    // 有尚未落盘的本地修改时，先等它写完再读盘，否则读到的旧数据会把内存里未保存的修改（如刚轮换的 refreshToken）覆盖掉
+    if (saveDebounceTimer || saveInFlight || savePendingResolvers.length > 0) {
+      await get().flushSaveImmediately()
+    }
     set({ isLoading: true })
 
     try {
@@ -1732,6 +1790,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoRefreshInterval: data.autoRefreshInterval ?? 5,
           autoRefreshConcurrency: data.autoRefreshConcurrency ?? 100,
           autoRefreshSyncInfo: data.autoRefreshSyncInfo ?? true,
+          batchImportConcurrency: data.batchImportConcurrency ?? 100,
+          loginPrivateMode: data.loginPrivateMode ?? false,
+          originalMachineId: data.originalMachineId ?? null,
+          originalBackupTime: data.originalBackupTime ?? null,
           statusCheckInterval: data.statusCheckInterval ?? 60,
           privacyMode: data.privacyMode ?? false,
           usagePrecision: data.usagePrecision ?? false,
@@ -1832,9 +1894,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const pending = savePendingResolvers
     savePendingResolvers = []
     if (saveInFlight) {
+      // 在途保存只包含它启动时的状态；等它结束后再补存一次最新状态，期间的修改才不会等到下一个定时保存
       const inflight = saveInFlight
-      void inflight.then(() => { for (const r of pending) r() })
-      return inflight
+      return inflight.then(async () => {
+        await get().flushSaveImmediately()
+        for (const r of pending) r()
+      })
     }
 
     const {
@@ -1845,6 +1910,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       autoRefreshEnabled,
       autoRefreshInterval,
       autoRefreshConcurrency,
+      autoRefreshSyncInfo,
+      batchImportConcurrency,
+      loginPrivateMode,
+      originalMachineId,
+      originalBackupTime,
       statusCheckInterval,
       privacyMode,
       usagePrecision,
@@ -1878,6 +1948,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoRefreshEnabled,
           autoRefreshInterval,
           autoRefreshConcurrency,
+          autoRefreshSyncInfo,
+          batchImportConcurrency,
+          loginPrivateMode,
+          originalMachineId,
+          originalBackupTime,
           statusCheckInterval,
           privacyMode,
           usagePrecision,
@@ -2143,7 +2218,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   },
 
   checkAndAutoSwitch: async () => {
-    const { accounts, autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
+    const { autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
     const activeAccount = get().getActiveAccount()
     
     if (!activeAccount) {
@@ -2167,8 +2242,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     if (remaining <= autoSwitchThreshold) {
       console.log(`[AutoSwitch] Account ${updatedAccount.email} reached threshold, switching...`)
       
-      // 查找可用的账号
-      const availableAccount = Array.from(accounts.values()).find(acc => {
+      // 查找可用的账号：await 期间账号数据可能已变，用最新的 Map 而不是进入函数时的快照
+      const availableAccount = Array.from(get().accounts.values()).find(acc => {
         // 排除当前账号
         if (acc.id === activeAccount.id) return false
         // 排除被封禁的账号
@@ -2222,14 +2297,20 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           }
         }
         if (target === 'cli' || target === 'both') {
+          // both 时 IDE 已刷新过 token，CLI 取回写后的最新凭证，避免同一个 refreshToken 被刷新两次
+          const latestCreds = target === 'both' ? get().accounts.get(availableAccount.id)?.credentials : undefined
           window.api.switchAccountCli?.({
-            accessToken: creds.accessToken || '',
-            refreshToken: creds.refreshToken || '',
+            accessToken: latestCreds?.accessToken || creds.accessToken || '',
+            refreshToken: latestCreds?.refreshToken || creds.refreshToken || '',
             clientId: creds.clientId,
             clientSecret: creds.clientSecret,
             region: creds.region || 'us-east-1',
             profileArn: (availableAccount as { profileArn?: string }).profileArn,
             provider: creds.provider
+          }).then(result => {
+            if (result?.success && result.refreshedCredentials) {
+              get().applySwitchRefreshedCredentials(availableAccount.id, result.refreshedCredentials)
+            }
           }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
         }
       } else {
@@ -2473,6 +2554,25 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   },
 
   // 批量处理后台刷新结果：合并 N 条结果到一次 set，避免 N 次 Map 全量复制
+  applySwitchRefreshedCredentials: (accountId, rc) => {
+    set((state) => {
+      const accounts = new Map(state.accounts)
+      const acc = accounts.get(accountId)
+      if (!acc) return {}
+      accounts.set(accountId, {
+        ...acc,
+        credentials: {
+          ...acc.credentials,
+          accessToken: rc.accessToken,
+          refreshToken: rc.refreshToken,
+          expiresAt: Date.now() + rc.expiresIn * 1000
+        }
+      })
+      return { accounts }
+    })
+    get().saveToStorage()
+  },
+
   applyBackgroundRefreshResults: (items) => {
     if (!items || items.length === 0) return
 
@@ -3453,13 +3553,16 @@ function parseProxyUrl(raw: string): ParsedProxy | null {
       if (!protocol) return null
       const port = Number(u.port) || defaultPort(protocol)
       if (!u.hostname || !Number.isFinite(port)) return null
+      // URL 里的 username/password 已是百分号编码；先解码，buildProxyUrl 才不会二次编码（%40 → %2540）
+      const username = u.username ? decodeURIComponent(u.username) : undefined
+      const password = u.password ? decodeURIComponent(u.password) : undefined
       return {
         protocol,
         host: u.hostname,
         port,
-        username: u.username ? decodeURIComponent(u.username) : undefined,
-        password: u.password ? decodeURIComponent(u.password) : undefined,
-        normalized: buildProxyUrl(protocol, u.hostname, port, u.username, u.password)
+        username,
+        password,
+        normalized: buildProxyUrl(protocol, u.hostname, port, username, password)
       }
     } catch {
       return null

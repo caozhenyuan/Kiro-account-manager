@@ -169,6 +169,8 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
       const next = new Map(state.tasks)
       const existing = next.get(id)
       if (!existing) return state
+      // 已处于终态（用户取消 / 已失败）的任务不被收尾逻辑改写
+      if (existing.status !== 'running' && existing.status !== 'paused') return state
       const successCount = summary?.successCount ?? existing.successCount
       const failedCount = summary?.failedCount ?? existing.failedCount
       const status: TaskStatus = summary?.error
