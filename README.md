@@ -264,6 +264,54 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.8.0 (2026-10-29) — Full-Project Code Review Fixes: Security Hardening + Proxy Stability + Data Persistence
+
+#### 🔒 Security Hardening
+
+- **Certificate verification restored on proxy paths**: connections through account-bound proxies, the proxy pool, environment proxies and system proxies (both HTTPS and SOCKS) had verification disabled, letting a proxy operator read and rewrite Bearer tokens and responses. Verification is now on by default; only the local K-Proxy (self-signed CA) is still exempt. **http(s)/SOCKS proxies that present self-signed certificates will now fail the handshake**
+- **Command injection fixed when opening the browser**: private-mode launching no longer interpolates the URL into a shell command. macOS/Linux use an argument array, Windows passes the URL through an environment variable, and only http(s) is accepted
+- **Admin API requires an API Key**: with no enabled key configured, `/admin/*` always returns 401; `/admin/config` validates field types and ranges and returns 400 for invalid values
+- **K-Proxy hardening**: listens on loopback only; domain matching is now exact-or-subdomain (it was a substring match, so `evilamazon.com` was also intercepted and signed); `Proxy-Authorization` is stripped when forwarding; CA key mode 0600, CA lifetime cut from 10 years to 2, the private key is no longer returned to the renderer; Linux CA install/uninstall uses `pkexec`
+- **SSRF protection for proxy image download**: loopback, private and link-local addresses are rejected, redirects are re-checked on every hop, and the body is read as a stream with a 10 MB cap
+- **Logout only clears Kiro's own login state**: it no longer wipes the whole `~/.aws/sso/cache`, so AWS CLI and other tools keep their cache
+- Verification codes are no longer logged; generated passwords use `crypto.randomInt`; proxy URLs are redacted consistently in logs and persisted data
+
+#### 🔁 Proxy Stability
+
+- **Upstream 429 now switches account and cools it down**: the 429 error text had no digits, so it was classified as a non-retryable 500, the throttled account was not cooled down, and the next request landed on it again
+- **Error classification is no longer confused by upstream bodies**: the status code is read only from fixed prefixes instead of scanning the body, so a request ID containing `401`/`429` can no longer mark an account as quota-exhausted
+- Failover re-applies the API Key account allow-list and group restrictions
+- An account whose token refresh failed gets one probe after the base cooldown instead of leaving rotation for good; the shared refresh task is no longer tied to the first request's abort signal
+- The forced-stop timer no longer kills new connections after a restart; after a listen failure the port can be changed and the server restarted
+- The `developer` role is treated as system; `tool_result.is_error` is passed upstream; non-streaming Claude `input_tokens` now match the streaming accounting
+- Invalid JSON returns 400; oversized bodies get a 413 first; malformed event-stream frames no longer loop forever; a full disk no longer raises an uncaught exception from the log file
+
+#### 💾 Data Persistence
+
+- Fixed "sync usage on refresh", batch-import concurrency, private-mode login and the original machine-ID backup being lost on restart; previously an empty original ID made the current (possibly already changed) machine ID the "original" backup
+- Accounts imported from TXT/CSV/card keys now get `authMethod`/`provider`, so Google/Github accounts no longer fail to refresh for lack of OIDC credentials
+- Background refresh results are persisted by the main process when the window is closed (macOS tray), so a server-rotated refresh token no longer leads to `invalid_grant` on the next round
+- Switching an account to Kiro CLI writes and returns the new refresh token; tray "Quit" now flushes data too
+- Pending saves are awaited before reading from disk; an in-flight save is followed by a save of the latest state; proactive renewal and IDE sync re-read the latest data before merging instead of overwriting the whole store
+- The same account is no longer re-imported on every start; proxy credentials with special characters are no longer double-encoded
+
+#### 📨 Registration and Mailboxes
+
+- Verification-code waits are deadline-based, 120 s at most (the worst case used to be several times longer), with a 150 s hard cap; `refreshOutlookToken` gains a timeout and cancellation
+- A failed device authorization is retried immediately instead of surfacing as "token polling timed out" after the whole flow has run
+- An attempt abandoned after a step timeout can no longer overwrite the state of the new attempt; one network error no longer makes TempMail.Plus skip a code email for good
+- In strict-proxy mode an invalid proxy now fails outright instead of silently connecting directly
+
+#### 🛠️ Other Fixes
+
+- Account error messages can be copied in full: click the error line to see the full text, and a copy button sits next to it
+- A banned account no longer re-fires the "account banned" webhook on every check; the webhook test returns the real result
+- The monthly quota trend counts only accounts that are still part of the total; cycle calculation no longer drifts on month-end reset dates
+- A newly registered account no longer shows a usage percentage about 100× too large before its first refresh; a failed shortcut registration is rolled back and reported
+- The Kiro settings path is chosen per platform (it was hard-coded to Windows); re-patching after a Kiro upgrade refreshes the backup
+
+---
+
 ### v1.7.16 (2026-10-29) — Notice and Fixes When the Quota Query Falls Back to Another Region
 
 #### 🌍 Show Which Region the Usage Actually Came From When the Quota Region Fails
