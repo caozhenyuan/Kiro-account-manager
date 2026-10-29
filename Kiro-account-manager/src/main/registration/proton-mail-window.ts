@@ -348,9 +348,11 @@ async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Pr
   // 故轮询间隔不沿用网络型邮箱的 intervalSec(默认3s)，钳到 ≤1s 让验证码到达后更快被读到。
   const pollMs = Math.min(Math.max(opts.intervalSec * 1000, 250), 1000)
   const maxRetries = Math.max(1, Math.floor((opts.timeoutSec * 1000) / pollMs))
+  const deadline = Date.now() + opts.timeoutSec * 1000
   const script = buildScanScript(address)
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  // 每轮耗时（点开邮件、读 DOM）不固定，按截止时间而不是轮次数收尾
+  for (let attempt = 1; Date.now() < deadline; attempt++) {
     if (opts.signal?.aborted) throw new Error('注册已取消')
 
     // 每 ~20 轮 reload 一次兜底（防止 SPA 长时间不刷新漏收）
@@ -363,7 +365,7 @@ async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Pr
       const res = (await w.webContents.executeJavaScript(script, true)) as ScanResult
       if (res && res.code && res.from === 'body') {
         // 收件人精确匹配当前注册地址（或收件人读不到时正文去点匹配）+ 读到 6 位码 → 当前邮件的验证码
-        log(`[Proton] 验证码: ${res.code} (${res.matched ? '收件人精确匹配' : '正文去点兜底匹配'})`)
+        log(`[Proton] 已提取验证码 (${res.matched ? '收件人精确匹配' : '正文去点兜底匹配'})`)
         return res.code
       } else if (res && res.from === 'wrong-recipient') {
         if (attempt % 8 === 0) log(`[Proton] 最新邮件收件人非当前地址，等待当前验证码... ${res.snippet || ''}`)

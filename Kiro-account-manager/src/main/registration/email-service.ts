@@ -52,6 +52,14 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
+/** 按截止时间等待：睡眠不超过剩余时间，返回 false 表示已到截止时间 */
+async function sleepUntilNextPoll(intervalSec: number, deadline: number, signal?: AbortSignal): Promise<boolean> {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return false
+  await abortableSleep(Math.min(intervalSec * 1000, remaining), signal)
+  return true
+}
+
 // ============ MoEmail 临时邮箱 ============
 
 export class MoEmailService implements TempEmailService {
@@ -115,9 +123,10 @@ export class MoEmailService implements TempEmailService {
     if (!this.address) throw new Error('邮箱地址为空')
 
     const maxRetries = Math.floor(timeoutSec / intervalSec)
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const deadline = Date.now() + timeoutSec * 1000
+    for (let attempt = 1; ; attempt++) {
       if (signal?.aborted) throw new Error('注册已取消')
-      await abortableSleep(intervalSec * 1000, signal)
+      if (!(await sleepUntilNextPoll(intervalSec, deadline, signal))) break
       try {
         const code = await this.fetchCode()
         if (code) return code
@@ -217,10 +226,11 @@ export class TempMailPlusService implements TempEmailService {
     if (!this.address) throw new Error('邮箱地址为空')
     const maxRetries = Math.floor(timeoutSec / intervalSec)
     const checkedIds = new Set<number>()
+    const deadline = Date.now() + timeoutSec * 1000
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    for (let attempt = 1; ; attempt++) {
       if (signal?.aborted) throw new Error('注册已取消')
-      await abortableSleep(intervalSec * 1000, signal)
+      if (!(await sleepUntilNextPoll(intervalSec, deadline, signal))) break
       try {
         const mails = await this.fetchMailList()
         if (attempt === 1 || attempt % 5 === 0) {
@@ -229,10 +239,17 @@ export class TempMailPlusService implements TempEmailService {
         for (const mail of mails) {
           const mailId = mail.mail_id as number
           if (checkedIds.has(mailId)) continue
-          checkedIds.add(mailId)
 
-          const detail = await this.fetchMailDetail(mailId)
+          // 详情取到之前不标记已检查：网络错误或空结果时，这封邮件下一轮还要再取
+          let detail: Record<string, unknown> | null
+          try {
+            detail = await this.fetchMailDetail(mailId)
+          } catch (err) {
+            console.log(`[TempMailPlus] 邮件 ${mailId} 详情获取失败，下一轮重试:`, err)
+            continue
+          }
           if (!detail) continue
+          checkedIds.add(mailId)
 
           // 验证收件人匹配
           const toField = String(detail.to || '').toLowerCase()
@@ -244,7 +261,7 @@ export class TempMailPlusService implements TempEmailService {
           // 提取验证码
           const code = this.extractOTP(detail)
           if (code) {
-            console.log(`[TempMailPlus] 验证码: ${code}`)
+            console.log('[TempMailPlus] 已提取验证码')
             await this.deleteMail(mailId)
             return code
           } else {
@@ -683,10 +700,11 @@ export class GptMailService implements TempEmailService {
     const userLocal = this.address.toLowerCase().split('@')[0]
     // 私有域名直收模式下，inbox = address，所有邮件 to 必然是 address，严格匹配即可
     const isPrivateDirect = !this.fixedInboxEmail
+    const deadline = Date.now() + timeoutSec * 1000
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    for (let attempt = 1; ; attempt++) {
       if (signal?.aborted) throw new Error('注册已取消')
-      await abortableSleep(intervalSec * 1000, signal)
+      if (!(await sleepUntilNextPoll(intervalSec, deadline, signal))) break
       try {
         const mails = await this.fetchMails()
         if (attempt === 1 || attempt % 5 === 0) {
@@ -721,7 +739,7 @@ export class GptMailService implements TempEmailService {
 
           const code = this.extractOTP(mail)
           if (code) {
-            console.log(`[GPTmail] 提取到验证码: ${code} (from=${mail.from_address ?? ''}, subject=${subject.slice(0, 60)})`)
+            console.log(`[GPTmail] 已提取验证码 (from=${mail.from_address ?? ''})`)
             // 不再全量 clear inbox：CF 转发模式下多任务共享同一 inbox，
             // 清空会误删别的任务待取的验证码。本次邮件已记入 checkedIds，
             // 后续实例靠 create() 重新捕获基线跳过，已足够避免重复取码。
@@ -815,7 +833,7 @@ export function parseOutlookLines(data: string): OutlookAccount[] {
   return accounts
 }
 
-export async function refreshOutlookToken(acc: OutlookAccount): Promise<string> {
+export async function refreshOutlookToken(acc: OutlookAccount, signal?: AbortSignal): Promise<string> {
   const form = new URLSearchParams({
     client_id: acc.clientId,
     refresh_token: acc.refreshToken,
@@ -825,7 +843,12 @@ export async function refreshOutlookToken(acc: OutlookAccount): Promise<string> 
 
   const resp = await proxyFetch(
     'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
-    { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString() }
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000)
+    }
   )
   const data = (await resp.json()) as Record<string, unknown>
   if (resp.status !== 200) throw new Error(`刷新失败 ${resp.status}: ${JSON.stringify(data).slice(0, 300)}`)
@@ -1025,10 +1048,11 @@ export async function waitForOTP(
   signal?: AbortSignal
 ): Promise<string> {
   console.log(`[Outlook IMAP] 等待验证码, 邮箱=${acc.email}, 发送前邮件数=${beforeCount}`)
-  let accessToken = await refreshOutlookToken(acc)
+  let accessToken = await refreshOutlookToken(acc, signal)
   const maxRetries = Math.floor(timeout / interval)
+  const deadline = Date.now() + timeout * 1000
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 1; Date.now() < deadline; attempt++) {
     if (signal?.aborted) throw new Error('注册已取消')
     let client: IMAPClient | null = null
     try {
@@ -1039,7 +1063,7 @@ export async function waitForOTP(
 
       if (total <= beforeCount) {
         if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 暂无新邮件 (当前${total}封)...`)
-        await abortableSleep(interval * 1000, signal)
+        await sleepUntilNextPoll(interval, deadline, signal)
         continue
       }
 
@@ -1048,7 +1072,7 @@ export async function waitForOTP(
           const body = await client.fetchLatestBody(i)
           const code = extractCode(body)
           if (code) {
-            console.log(`[Outlook IMAP] 获取到验证码: ${code}`)
+            console.log('[Outlook IMAP] 已获取验证码')
             return code
           }
         } catch { /* continue */ }
@@ -1057,11 +1081,11 @@ export async function waitForOTP(
       if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 新邮件中未找到验证码...`)
     } catch (err) {
       if (attempt % 5 === 0) console.log(`[Outlook IMAP] 连接失败:`, err)
-      try { accessToken = await refreshOutlookToken(acc) } catch { /* ignore */ }
+      try { accessToken = await refreshOutlookToken(acc, signal) } catch { /* ignore */ }
     } finally {
       client?.close()
     }
-    await abortableSleep(interval * 1000, signal)
+    await sleepUntilNextPoll(interval, deadline, signal)
   }
   throw new Error(`等待验证码超时 (${timeout}s)`)
 }

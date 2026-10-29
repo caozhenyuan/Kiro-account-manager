@@ -135,8 +135,15 @@ export class ChainProxyRelay {
       }
       const host = m[1]
       const port = Number(m[2])
+      // 握手期间客户端可能已经断开：在建链之前就监听，晚到的隧道才能及时回收
+      let clientGone = client.destroyed
+      client.once('close', () => { clientGone = true })
       this.dialChain(host, port)
         .then((tunnel) => {
+          if (clientGone) {
+            tunnel.destroy()
+            return
+          }
           client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
           client.pipe(tunnel)
           tunnel.pipe(client)
@@ -154,14 +161,20 @@ export class ChainProxyRelay {
   /** 经上游中转连到目标代理入口，再在该连接上对目标代理做 CONNECT 抵达最终目标 */
   private async dialChain(host: string, port: number): Promise<net.Socket> {
     const sock = await this.connectViaUpstream(this.target.host, this.target.port)
+    let timer: NodeJS.Timeout | undefined
     try {
-      const resp = await this.sendConnectRequest(sock, host, port, this.target)
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('目标代理握手超时')), 20000)
+      })
+      const resp = await Promise.race([this.sendConnectRequest(sock, host, port, this.target), timeout])
       if (resp.status !== 200) {
         throw new Error(this.formatConnectError('目标代理', resp))
       }
     } catch (err) {
       sock.destroy()
       throw err
+    } finally {
+      if (timer) clearTimeout(timer)
     }
     return sock
   }

@@ -51,6 +51,7 @@ export async function refreshAppJSConfig(
           Referer: 'https://us-east-1.signin.aws/'
         }
       })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
       const js = await resp.text()
       if (js) {
         const result = extractFromAppJS(js)
@@ -62,13 +63,12 @@ export async function refreshAppJSConfig(
       console.log('[xxtea] 下载 app.js 失败:', err)
     }
 
-    if (!cachedKey) {
-      console.log('[xxtea] 使用 fallback 密钥')
-      cachedKey = [...FALLBACK_KEY] as [number, number, number, number]
-    }
-    if (!cachedVersion) cachedVersion = FALLBACK_VER
-    if (!cachedIdentifier) cachedIdentifier = FALLBACK_IDENTIFIER
-  })()
+    // 没拿到密钥时不缓存 fallback：getActiveKey 等读取函数本身会回落到 fallback，
+    // 而 cachedKey 保持为空，下次调用会重新尝试下载，不会因一次网络失败永久锁死
+    if (!cachedKey) console.log('[xxtea] 本次使用 fallback 密钥，下次将重试下载')
+  })().finally(() => {
+    refreshPromise = null
+  })
 
   return refreshPromise
 }

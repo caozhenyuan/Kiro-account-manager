@@ -71,6 +71,15 @@ export interface RegStepEvent {
 
 export type StepFn2 = (event: RegStepEvent) => void
 
+// 验证码等待的硬上限：邮箱服务自身按 120s 截止时间轮询，这里再留余量兜住单次请求卡住的情况
+const OTP_HARD_TIMEOUT_MS = 150_000
+
+class StaleAttemptError extends Error {
+  constructor() {
+    super('步骤已超时并被新的尝试取代')
+  }
+}
+
 export class Registrar {
   private cfg: RegistrationConfig
   private session: SessionClient | null = null
@@ -102,6 +111,8 @@ export class Registrar {
   private log: LogFn
   private onStep: StepFn2
   private abortController = new AbortController()
+  /** retryStep 每次尝试递增；超时被放弃的旧尝试据此在 sendRequest 处中止，避免晚到的响应改写共享的 cookies/workflowHandle */
+  private stepGeneration = 0
   private chainRelay: ChainProxyRelay | null = null
   private chainTargetProxy = ''
   private exitIP = ''
@@ -176,6 +187,10 @@ export class Registrar {
       const proxyUrl = this.sessionOpts.proxyUrl
       try {
         const agent = safeCreateProxyAgent(proxyUrl)
+        // 严格模式下代理不可用就不能直连探测，否则日志显示 via proxy 实际是真实 IP
+        if (this.cfg.strictProxy && proxyUrl && !agent) {
+          throw new Error('严格代理模式：代理 URL 无效或协议不支持，已拒绝直连探测')
+        }
         const resp = await undiciFetch('https://api.ipify.org?format=json', {
           method: 'GET',
           dispatcher: agent || undefined,
@@ -189,7 +204,7 @@ export class Registrar {
             this.exitIP = ip
             this.emitStep('exit-ip', { exitIp: ip })
           }
-          const via = proxyUrl ? proxyUrl.replace(/:([^:@/]+)@/, ':***@') : undefined
+          const via = proxyUrl ? redactString(proxyUrl) : undefined
           this.log(`[✓ IP] 出口 IP: ${ip || '未知'}${via ? ` (via ${via})` : ' (直连)'}`)
           return // 成功，退出
         }
@@ -272,7 +287,7 @@ export class Registrar {
       // 配合 sendRequest 的 3 次重试，单步最坏 ~75s（旧值 60s 会到 ~180s，是批量卡 1-5 分钟主因）
       timeoutSeconds: 25,
       followRedirects: true,
-      insecureSkipVerify: true,
+      insecureSkipVerify: false,
       // 多线程隔离：固定 sessionId 隔离 DLL 层面共享的 TLS session cache
       // 整个 Registrar 生命周期内用同一个 ID，避免 rebuildTlsClient 产生僵尸 session
       sessionId: this.tlsSessionId,
@@ -386,11 +401,17 @@ export class Registrar {
    * 静态资源不需要 TLS 指纹伪装，直接用 Node/undici fetch 即可。
    */
   private async fetchAppJS(url: string, init?: RequestInit): Promise<Response> {
-    const proxyUrl = (this.cfg.proxy && this.cfg.proxy.trim())
-      || process.env.HTTPS_PROXY || process.env.https_proxy
-      || process.env.HTTP_PROXY || process.env.http_proxy
-      || getSystemProxy() || undefined
+    const explicitProxy = (this.cfg.proxy && this.cfg.proxy.trim()) || undefined
+    const proxyUrl = this.cfg.strictProxy
+      ? explicitProxy
+      : (explicitProxy
+        || process.env.HTTPS_PROXY || process.env.https_proxy
+        || process.env.HTTP_PROXY || process.env.http_proxy
+        || getSystemProxy() || undefined)
     const agent = safeCreateProxyAgent(proxyUrl)
+    if (this.cfg.strictProxy && proxyUrl && !agent) {
+      throw new Error('严格代理模式：代理 URL 无效或协议不支持，已拒绝直连下载')
+    }
     if (agent) {
       const resp = await undiciFetch(url, { ...(init as UndiciRequestInit), dispatcher: agent })
       return resp as unknown as Response
@@ -500,11 +521,8 @@ export class Registrar {
    * 关键：tlsclientwrapper 会把连接层失败（EOF / 重置 / 超时）包装成 status=0 + body 错误描述，
    * 并不抛异常；若不在响应层识别，会被上层当成业务失败直接判死号（如 #9 的「未获取到加密公钥」）。
    */
-  private isTransientResponse(status: number, body: string): boolean {
-    if (status === 0 || status === 429 || status === 502 || status === 503 || status === 504) return true
-    const lower = body.toLowerCase()
-    return lower.includes('failed to do request') || lower.includes('eof')
-      || lower.includes('connection reset') || lower.includes('timeout')
+  private isTransientResponse(status: number): boolean {
+    return status === 0 || status === 429 || status === 502 || status === 503 || status === 504
   }
 
   /**
@@ -533,15 +551,21 @@ export class Registrar {
     const maxAttempts = 3
     let lastErr: unknown = null
     let sessionRefreshed = false // 整个请求最多换 1 次 proxy session，避免频繁停建代理链
+    const generation = this.stepGeneration
+    const assertCurrent = (): void => {
+      if (generation !== this.stepGeneration) throw new StaleAttemptError()
+    }
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
+        assertCurrent()
         const resp = method === 'GET'
           ? await this.session!.get(url, { headers })
           : await this.session!.post(url, body ?? '', { headers })
+        assertCurrent()
         const decoded = this.decodeBody(resp.body)
         const status = resp.status
-        if (attempt < maxAttempts && this.isTransientResponse(status, decoded)) {
-          const broken = status === 0 || /eof|reset|failed to do request/i.test(decoded)
+        if (attempt < maxAttempts && this.isTransientResponse(status)) {
+          const broken = status === 0
           // 超时类（出口 IP 慢/被限/隧道挂起）：重建 TLS 同 IP 无用，换 proxy session 切换出口 IP
           if (this.isTimeoutResponse(status, decoded) && !sessionRefreshed && this.canRefreshProxySession()) {
             this.log(`[Net] ${method} 超时(status=${status})，换 proxy session 切换出口 IP 重试 ${attempt}/${maxAttempts - 1}`)
@@ -562,6 +586,7 @@ export class Registrar {
         }
         return { body: decoded, status, headers: (resp.headers || {}) as Record<string, string | string[]> }
       } catch (err: unknown) {
+        if (err instanceof StaleAttemptError) throw err
         lastErr = err
         if (attempt < maxAttempts && this.isRecoverableTlsClientError(err)) {
           this.log(`[TLS] ${method} 可恢复错误：${err instanceof Error ? err.message : String(err)}，重建 TLS 退避重试 ${attempt}/${maxAttempts - 1}`)
@@ -632,6 +657,8 @@ export class Registrar {
   ): Promise<void> {
     let lastErr: unknown = null
     for (let i = 1; i <= attempts; i++) {
+      // 新一次尝试开始，之前超时被放弃的尝试从此失效
+      this.stepGeneration++
       try {
         if (opts?.timeoutMs) await this.withTimeout(fn(), opts.timeoutMs, name)
         else await fn()
@@ -823,9 +850,15 @@ export class Registrar {
       clientId: this.clientId, clientSecret: this.clientSecret,
       startUrl: this.cfg.startURL
     }, { 'Content-Type': 'application/json' })
+    // 限流 / 服务端错误时响应里没有 deviceCode；在这里抛错才能让外层 retryStep 重试，
+    // 否则要等到整个注册走完、Token 轮询超时才暴露，此时账号已经创建
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`设备授权失败 HTTP ${resp.status}`)
+    }
     const data = this.parseBody(resp.body)
     this.deviceCode = (data.deviceCode as string) || ''
     this.userCode = (data.userCode as string) || ''
+    if (!this.deviceCode || !this.userCode) throw new Error('设备授权响应缺少 deviceCode/userCode')
     this.log(`user_code=${this.userCode}`)
   }
 
@@ -1181,10 +1214,10 @@ export class Registrar {
       const accounts = parseOutlookLines(this.cfg.outlookData)
       const acc = accounts.find((a) => a.email === this.email)
       if (!acc) throw new Error('未找到对应 Outlook 账号')
-      return await waitForOTP(acc, this.outlookMailCount, 120, 5, signal)
+      return await this.withTimeout(waitForOTP(acc, this.outlookMailCount, 120, 5, signal), OTP_HARD_TIMEOUT_MS, 'GetOTP')
     }
     if (!this.emailSvc) throw new Error('邮箱服务未初始化')
-    return await this.emailSvc.waitForCode(120, 3, signal)
+    return await this.withTimeout(this.emailSvc.waitForCode(120, 3, signal), OTP_HARD_TIMEOUT_MS, 'GetOTP')
   }
 
   private async step11CreateIdentity(otp: string): Promise<void> {
@@ -1692,7 +1725,7 @@ export class Registrar {
       canvasHash: this.identity.canvasHash,
       screen: { width: this.identity.screen.width, height: this.identity.screen.height },
       // 脱敏后保存（隐藏密码部分），同时确保系统/环境变量代理也被捕获
-      proxyUrl: resolved ? resolved.replace(/:([^:@/]+)@/, ':***@') : undefined,
+      proxyUrl: resolved ? redactString(resolved) : undefined,
       exitIP: this.exitIP || undefined
     }
   }

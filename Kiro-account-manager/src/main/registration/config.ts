@@ -1,3 +1,4 @@
+import { randomInt } from 'crypto'
 import { randomFullName } from './browser-identity'
 
 export interface RegistrationConfig {
@@ -61,16 +62,17 @@ export function genPassword(): string {
   const lower = 'abcdefghijklmnopqrstuvwxyz'
   const digits = '0123456789'
   const special = '!@#$%^&*'
+  const pick = (chars: string): string => chars[randomInt(chars.length)]
 
   let pw = ''
-  for (let i = 0; i < 3; i++) pw += upper[Math.floor(Math.random() * upper.length)]
-  for (let i = 0; i < 6; i++) pw += lower[Math.floor(Math.random() * lower.length)]
-  for (let i = 0; i < 3; i++) pw += digits[Math.floor(Math.random() * digits.length)]
-  for (let i = 0; i < 2; i++) pw += special[Math.floor(Math.random() * special.length)]
+  for (let i = 0; i < 3; i++) pw += pick(upper)
+  for (let i = 0; i < 6; i++) pw += pick(lower)
+  for (let i = 0; i < 3; i++) pw += pick(digits)
+  for (let i = 0; i < 2; i++) pw += pick(special)
 
   const arr = pw.split('')
   for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
+    const j = randomInt(i + 1)
     ;[arr[i], arr[j]] = [arr[j], arr[i]]
   }
   return arr.join('')
