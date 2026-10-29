@@ -52,6 +52,12 @@ export class MitmProxy {
       return
     }
 
+    // 代理没有鉴权，且持有可签发任意域名证书的 CA：只允许监听回环地址
+    const host = (this.config.host || '').toLowerCase()
+    if (host !== '127.0.0.1' && host !== '::1' && host !== 'localhost') {
+      throw new Error(`K-Proxy 仅允许监听本机回环地址（当前为 ${this.config.host}）`)
+    }
+
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => {
         this.handleHttpRequest(req, res)
@@ -110,9 +116,14 @@ export class MitmProxy {
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       }
-      srv.close(() => finish())
+      let fallbackTimer: NodeJS.Timeout | null = null
+      const done = (): void => {
+        if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null }
+        finish()
+      }
+      srv.close(() => done())
       // 双保险：1 秒后无论 close 回调是否触发都 resolve
-      setTimeout(finish, 1000)
+      fallbackTimer = setTimeout(done, 1000)
     })
   }
 
@@ -124,12 +135,15 @@ export class MitmProxy {
     this.stats.lastRequestTime = Date.now()
 
     const targetUrl = url.parse(req.url || '')
+    // 代理凭据与逐跳头只对本代理有意义，不能转发给目标服务器
+    const forwardHeaders = { ...req.headers }
+    for (const name of ['proxy-authorization', 'proxy-connection']) delete forwardHeaders[name]
     const options: http.RequestOptions = {
       hostname: targetUrl.hostname,
       port: targetUrl.port || 80,
       path: targetUrl.path,
       method: req.method,
-      headers: req.headers
+      headers: forwardHeaders
     }
 
     const proxyReq = http.request(options, (proxyRes) => {
@@ -179,8 +193,13 @@ export class MitmProxy {
    * 检查域名是否需要 MITM
    */
   private shouldMitm(hostname: string): boolean {
-    for (const domain of this.config.mitmDomains) {
-      if (hostname.includes(domain)) {
+    const host = hostname.toLowerCase().replace(/\.$/, '')
+    for (const rawDomain of this.config.mitmDomains) {
+      // 兼容 "kiro.dev" / ".kiro.dev" / "*.kiro.dev" 写法；按完整域名或子域匹配，
+      // 不做子串匹配，避免 evilkiro.dev 之类被拦截并用本地 CA 签发
+      const domain = rawDomain.trim().toLowerCase().replace(/^\*?\./, '')
+      if (!domain) continue
+      if (host === domain || host.endsWith(`.${domain}`)) {
         if (this.config.logRequests) {
           console.log(`[MitmProxy] MITM: ${hostname} matches ${domain}`)
         }
@@ -270,23 +289,25 @@ export class MitmProxy {
     hostname: string, 
     port: number
   ): void {
-    let requestData = ''
+    let requestData: Buffer = Buffer.alloc(0)
     let headersParsed = false
     let contentLength = 0
     let bodyReceived = 0
     let modifiedHeaders: string = ''
     let requestInfo: KProxyRequestInfo | null = null
+    const headerTerminator = Buffer.from('\r\n\r\n')
 
     clientSocket.on('data', (chunk: Buffer) => {
       if (!headersParsed) {
-        requestData += chunk.toString()
-        const headerEnd = requestData.indexOf('\r\n\r\n')
-        
+        requestData = Buffer.concat([requestData, chunk])
+        const headerEnd = requestData.indexOf(headerTerminator)
+
         if (headerEnd !== -1) {
           headersParsed = true
-          const headers = requestData.substring(0, headerEnd)
-          const body = requestData.substring(headerEnd + 4)
-          
+          // 请求头与请求体都按字节处理：latin1 与字节一一对应，往返不会改变任何字节
+          const headers = requestData.subarray(0, headerEnd).toString('latin1')
+          const body = requestData.subarray(headerEnd + 4)
+
           // 解析并修改请求头
           const { modified, newHeaders, info } = this.modifyHeaders(headers, hostname)
           modifiedHeaders = newHeaders
@@ -304,15 +325,14 @@ export class MitmProxy {
             contentLength = parseInt(clMatch[1], 10)
           }
 
-          // 替换 body 中的 machineId
+          // 替换 body 中的 machineId（仅 64 位十六进制串，其余字节原样保留）
           const modifiedBody = this.modifyBody(body)
-          if (modifiedBody !== body) {
-            // body 长度变了，更新 Content-Length
-            const newLength = contentLength - Buffer.byteLength(body) + Buffer.byteLength(modifiedBody)
+          if (modifiedBody.length !== body.length) {
+            const newLength = contentLength - body.length + modifiedBody.length
             modifiedHeaders = modifiedHeaders.replace(/content-length:\s*\d+/i, `content-length: ${newLength}`)
             contentLength = newLength
           }
-          bodyReceived = Buffer.byteLength(modifiedBody)
+          bodyReceived = modifiedBody.length
 
           // 转发请求到目标服务器
           this.forwardRequest(modifiedHeaders, modifiedBody, hostname, port, clientSocket, contentLength, bodyReceived)
@@ -328,13 +348,19 @@ export class MitmProxy {
   /**
    * 替换请求体中的 Machine ID
    */
-  private modifyBody(body: string): string {
+  private modifyBody(body: Buffer): Buffer {
     const targetDeviceId = this.config.deviceId
-    if (!targetDeviceId || !body) return body
+    if (!targetDeviceId || body.length === 0) return body
+    // latin1 解码与字节一一对应，非 ASCII 内容（如 CBOR 二进制体）不会被改动
+    const text = body.toString('latin1')
     // 只在 body 中包含 64 位十六进制时才替换（避免误伤无关内容）
-    if (!MACHINE_ID_REGEX.test(body)) return body
     MACHINE_ID_REGEX.lastIndex = 0
-    const result = body.replace(MACHINE_ID_REGEX, (match) => {
+    if (!MACHINE_ID_REGEX.test(text)) {
+      MACHINE_ID_REGEX.lastIndex = 0
+      return body
+    }
+    MACHINE_ID_REGEX.lastIndex = 0
+    const result = text.replace(MACHINE_ID_REGEX, (match) => {
       // 不替换已经是目标 ID 的
       if (match.toLowerCase() === targetDeviceId.toLowerCase()) return match
       if (this.config.logRequests) {
@@ -343,7 +369,7 @@ export class MitmProxy {
       return targetDeviceId
     })
     MACHINE_ID_REGEX.lastIndex = 0
-    return result
+    return result === text ? body : Buffer.from(result, 'latin1')
   }
 
   /**
@@ -418,7 +444,7 @@ export class MitmProxy {
    */
   private forwardRequest(
     headers: string,
-    initialBody: string,
+    initialBody: Buffer,
     hostname: string,
     port: number,
     clientSocket: tls.TLSSocket,
@@ -440,9 +466,9 @@ export class MitmProxy {
     }, () => {
       connected = true
       // 发送修改后的请求头
-      serverSocket.write(headers + '\r\n\r\n')
+      serverSocket.write(Buffer.from(headers + '\r\n\r\n', 'latin1'))
       // 发送已接收的请求体
-      if (initialBody) {
+      if (initialBody.length > 0) {
         serverSocket.write(initialBody)
       }
       // 冲刷握手期间缓存的 body 分片

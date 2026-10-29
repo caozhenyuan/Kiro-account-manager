@@ -41,6 +41,7 @@ export class CertManager {
     // 尝试加载现有证书
     if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
       try {
+        try { fs.chmodSync(keyPath, 0o600) } catch { /* Windows 等不支持 POSIX 权限的平台忽略 */ }
         const certPem = fs.readFileSync(certPath, 'utf8')
         const keyPem = fs.readFileSync(keyPath, 'utf8')
         
@@ -78,10 +79,10 @@ export class CertManager {
     cert.publicKey = keys.publicKey
     cert.serialNumber = this.generateSerialNumber()
     
-    // 设置有效期（10年）
+    // 设置有效期（2年）：装入系统信任库的 CA 私钥一旦泄露可签任意域名，缩短暴露窗口
     cert.validity.notBefore = new Date()
     cert.validity.notAfter = new Date()
-    cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 10)
+    cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 2)
 
     // 设置证书属性
     const attrs = [
@@ -119,7 +120,7 @@ export class CertManager {
 
     // 保存到文件
     fs.writeFileSync(certPath, certPem)
-    fs.writeFileSync(keyPath, keyPem)
+    fs.writeFileSync(keyPath, keyPem, { mode: 0o600 })
 
     this.caCert = cert
     this.caKey = keys.privateKey

@@ -280,12 +280,14 @@ function patchFile(filePath) {
     return { changed: true, touched, dryRun: true };
   }
 
+  // 走到这里说明当前文件未打过补丁，它就是最新的原版。备份与之不同说明是旧版本 Kiro 的备份，
+  // 若保留会让 --restore 用旧版 extension.js 覆盖升级后的新版，必须刷新。
   const bakPath = `${filePath}.kpatch-backup`;
-  if (!fs.existsSync(bakPath)) {
+  if (!fs.existsSync(bakPath) || fs.readFileSync(bakPath, 'utf8') !== original) {
     fs.writeFileSync(bakPath, original);
     log.debug(`backup written: ${bakPath}`);
   } else {
-    log.debug(`backup already exists, kept as-is: ${bakPath}`);
+    log.debug(`backup already matches current file: ${bakPath}`);
   }
   fs.writeFileSync(filePath, patched);
   log.info(`patched ${filePath} (${touched} replacement(s))`);

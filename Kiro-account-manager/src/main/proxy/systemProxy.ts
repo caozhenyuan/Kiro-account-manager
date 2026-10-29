@@ -132,7 +132,8 @@ export function getSystemProxy(): string | null {
  * 而不会让异常向上传播阻塞业务流程。
  */
 export function safeCreateProxyAgent(
-  proxyUrl: string | null | undefined
+  proxyUrl: string | null | undefined,
+  options?: { insecureTls?: boolean }
 ): Dispatcher | undefined {
   if (!proxyUrl) return undefined
 
@@ -150,7 +151,9 @@ export function safeCreateProxyAgent(
   // http / https 走原生 ProxyAgent
   if (protocol === 'http:' || protocol === 'https:') {
     try {
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      return options?.insecureTls
+        ? new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+        : new ProxyAgent({ uri: proxyUrl })
     } catch (err) {
       console.warn(`[Proxy] 创建 HTTP ProxyAgent 失败，回退直连: ${proxyUrl}`, err)
       return undefined
@@ -160,7 +163,7 @@ export function safeCreateProxyAgent(
   // SOCKS 走自定义 connect
   if (protocol === 'socks5:' || protocol === 'socks5h:' || protocol === 'socks4:' || protocol === 'socks4a:') {
     try {
-      return createSocksDispatcher(u)
+      return createSocksDispatcher(u, options?.insecureTls === true)
     } catch (err) {
       console.warn(`[Proxy] 创建 SOCKS Agent 失败，回退直连: ${proxyUrl}`, err)
       return undefined
@@ -175,7 +178,7 @@ export function safeCreateProxyAgent(
  * 通过 undici Agent 的 connect 钩子实现 SOCKS5/4 隧道
  * 流程：socks.createConnection 建立 TCP 隧道 → 如目标是 https 再 TLS 升级 → 把 socket 交给 undici
  */
-function createSocksDispatcher(u: URL): Agent {
+function createSocksDispatcher(u: URL, insecureTls: boolean): Agent {
   const isSocks5 = u.protocol === 'socks5:' || u.protocol === 'socks5h:'
   const type: 4 | 5 = isSocks5 ? 5 : 4
   const proxyHost = u.hostname
@@ -211,7 +214,7 @@ function createSocksDispatcher(u: URL): Agent {
             const tlsSocket = tls.connect({
               socket,
               servername: options.servername || targetHost,
-              rejectUnauthorized: options.rejectUnauthorized ?? false
+              rejectUnauthorized: !insecureTls
             })
             tlsSocket.once('secureConnect', () => callback(null, tlsSocket))
             tlsSocket.once('error', (err) => callback(err, null))
