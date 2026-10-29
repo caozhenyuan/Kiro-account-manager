@@ -183,7 +183,7 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
           throw new Error('message input item requires content')
         }
         messages.push({
-          role: item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user',
+          role: item.role === 'assistant' ? 'assistant' : item.role === 'system' || item.role === 'developer' ? 'system' : 'user',
           content: convertResponseInputContent(item.content)
         })
       }
@@ -320,7 +320,7 @@ export function openaiToKiro(
   const nonSystemMessages: OpenAIMessage[] = []
 
   for (const msg of request.messages) {
-    if (msg.role === 'system') {
+    if (msg.role === 'system' || msg.role === 'developer') {
       systemCachePoint = mergeCachePoint(systemCachePoint, toKiroCachePoint(msg.cache_control))
       if (typeof msg.content === 'string') {
         systemPrompt += (systemPrompt ? '\n' : '') + msg.content
@@ -1098,7 +1098,7 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
         toolResults.push({
           toolUseId: block.tool_use_id,
           content: [{ text: resultContent }],
-          status: 'success'
+          status: block.is_error ? 'error' : 'success'
         })
       }
     }
@@ -1229,8 +1229,9 @@ export function kiroToClaudeResponse(
     })
   }
 
+  // Kiro 的 inputTokens 含缓存部分，Anthropic 规范的 input_tokens 不含，需扣除（与流式 buildClaudeUsage 一致）
   const claudeUsage: ClaudeResponse['usage'] = {
-    input_tokens: usage.inputTokens,
+    input_tokens: Math.max(0, usage.inputTokens - (usage.cacheWriteTokens || 0) - (usage.cacheReadTokens || 0)),
     output_tokens: usage.outputTokens
   }
   if (usage.cacheWriteTokens) {

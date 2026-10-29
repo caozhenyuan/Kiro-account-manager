@@ -29,6 +29,8 @@ export interface RequestContext {
   endpoints: string[]
   /** 模型映射后的模型名；仅模型请求会设置，用于决定是否输出汇总 */
   model?: string
+  /** 本次请求匹配到的 API Key，故障转移时据此重新应用账号白名单 */
+  apiKeyId?: string
 }
 
 const requestContextStorage = new AsyncLocalStorage<RequestContext>()
@@ -39,6 +41,11 @@ export function runWithRequestContext<T>(ctx: RequestContext, fn: () => T): T {
 
 export function getRequestContext(): RequestContext | undefined {
   return requestContextStorage.getStore()
+}
+
+export function setRequestApiKeyId(apiKeyId: string | undefined): void {
+  const ctx = requestContextStorage.getStore()
+  if (ctx) ctx.apiKeyId = apiKeyId
 }
 
 export function setRequestModel(model: string | undefined): void {
@@ -161,7 +168,13 @@ class ProxyLogger {
       // 创建新的日志文件
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
       this.currentLogFile = path.join(this.config.logDir, `proxy-${timestamp}.log`)
-      this.logStream = fs.createWriteStream(this.currentLogFile, { flags: 'a' })
+      const stream = fs.createWriteStream(this.currentLogFile, { flags: 'a' })
+      // 磁盘写满等写入错误不能成为未捕获异常；出错后停止写文件，内存日志不受影响
+      stream.on('error', (err) => {
+        console.error('[ProxyLogger] Log stream error, file logging disabled:', err.message)
+        if (this.logStream === stream) this.logStream = null
+      })
+      this.logStream = stream
       this.currentFileSize = 0
 
       this.info('Logger', 'Log file initialized', { file: this.currentLogFile })

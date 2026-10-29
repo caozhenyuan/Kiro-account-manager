@@ -4,7 +4,8 @@ import https from 'https'
 import fs from 'fs'
 import crypto from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
-import type { Socket } from 'net'
+import { isIP, type Socket } from 'net'
+import { lookup as dnsLookup } from 'dns/promises'
 import type {
   OpenAIChatRequest,
   OpenAIMessage,
@@ -19,7 +20,7 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
-import { proxyLogger, runWithRequestContext, getRequestContext, setRequestModel } from './logger'
+import { proxyLogger, runWithRequestContext, getRequestContext, setRequestModel, setRequestApiKeyId } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -255,6 +256,14 @@ class BodyTooLargeError extends Error {
   }
 }
 
+// 请求体不是合法 JSON（触发 400 响应）
+class InvalidJsonBodyError extends Error {
+  constructor() {
+    super('Invalid JSON in request body')
+    this.name = 'InvalidJsonBodyError'
+  }
+}
+
 export class ProxyServer {
   private server: http.Server | https.Server | null = null
   private fallbackServer: http.Server | null = null  // HTTPS 启用时同时监听 HTTP（可选）
@@ -424,7 +433,13 @@ export class ProxyServer {
         this.isHttps = false
       }
 
+      const failedServer = this.server
       this.server.on('error', (error: NodeJS.ErrnoException) => {
+        // 监听失败时 server 并未处于监听状态，复位后才能换端口重新 start()
+        if (!failedServer.listening && this.server === failedServer) {
+          this.server = null
+          if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
+        }
         if (error.code === 'EADDRINUSE') {
           console.error(`[ProxyServer] Port ${this.config.port} is already in use`)
           reject(new Error(`Port ${this.config.port} is already in use`))
@@ -585,17 +600,22 @@ export class ProxyServer {
     const main = this.server
     const fallback = this.fallbackServer
 
+    // 只销毁停止时已存在的连接；重启后新服务器的连接不在其中
+    const socketsAtStop = new Set(this.sockets)
+
     return new Promise((resolve) => {
       let done = false
+      let forceTimer: NodeJS.Timeout | null = null
       const finish = () => {
         if (done) return
         done = true
+        if (forceTimer) { clearTimeout(forceTimer); forceTimer = null }
         proxyLogger.info('ProxyServer', 'Stopped')
         this.server = null
         this.fallbackServer = null
         this.isStopping = false
         this.activeRequests.clear()
-        this.sockets.clear()
+        for (const socket of socketsAtStop) this.sockets.delete(socket)
         if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
@@ -614,8 +634,8 @@ export class ProxyServer {
       })
 
       // 超时强制 destroy
-      setTimeout(() => {
-        this.sockets.forEach(socket => { try { socket.destroy() } catch { /* ignore */ } })
+      forceTimer = setTimeout(() => {
+        socketsAtStop.forEach(socket => { try { socket.destroy() } catch { /* ignore */ } })
         finish()
       }, Math.max(0, gracefulMs))
     })
@@ -702,7 +722,42 @@ export class ProxyServer {
     request.tools?.forEach(tool => this.validateCacheControl(tool.cache_control))
   }
 
+  // 回环、内网、链路本地（含云元数据 169.254.169.254）、CGNAT、组播等地址
+  private isPrivateAddress(address: string): boolean {
+    const mapped = address.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i)
+    const ip = mapped ? mapped[1] : address
+    const family = isIP(ip)
+    if (family === 4) {
+      const [a, b] = ip.split('.').map(Number)
+      return a === 0 || a === 10 || a === 127 || a >= 224
+        || (a === 169 && b === 254)
+        || (a === 172 && b >= 16 && b <= 31)
+        || (a === 192 && b === 168)
+        || (a === 100 && b >= 64 && b <= 127)
+    }
+    if (family === 6) {
+      const lower = ip.toLowerCase()
+      return lower === '::' || lower === '::1' || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower) || lower.startsWith('ff')
+    }
+    return true
+  }
+
+  private async assertPublicImageHost(url: URL): Promise<void> {
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error('Image URL must be http(s)')
+    }
+    const host = url.hostname.replace(/^\[|\]$/g, '')
+    const addresses = isIP(host)
+      ? [host]
+      : (await dnsLookup(host, { all: true })).map((r) => r.address)
+    if (addresses.length === 0 || addresses.some((addr) => this.isPrivateAddress(addr))) {
+      throw new Error('Image URL host is not allowed')
+    }
+  }
+
   private async downloadImageDataUrl(url: string, signal?: AbortSignal): Promise<string> {
+    const maxBytes = 10 * 1024 * 1024
+    const maxRedirects = 3
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
     const abort = () => controller.abort(this.getAbortError(signal))
@@ -717,9 +772,25 @@ export class ProxyServer {
         return safeCreateProxyAgent(getSystemProxy())
       })()
       const { fetch: undiciFetch } = require('undici')
-      const response = agent
-        ? await undiciFetch(url, { signal: controller.signal, dispatcher: agent }) as unknown as globalThis.Response
-        : await fetch(url, { signal: controller.signal })
+
+      // 重定向手动跟随，每一跳都重新校验目标主机
+      let current = new URL(url)
+      let response: globalThis.Response | null = null
+      for (let hop = 0; hop <= maxRedirects; hop++) {
+        await this.assertPublicImageHost(current)
+        const init = { signal: controller.signal, redirect: 'manual' as const }
+        const res = agent
+          ? await undiciFetch(current.href, { ...init, dispatcher: agent }) as unknown as globalThis.Response
+          : await fetch(current.href, init)
+        const location = res.headers.get('location')
+        if (res.status >= 300 && res.status < 400 && location) {
+          current = new URL(location, current)
+          continue
+        }
+        response = res
+        break
+      }
+      if (!response) throw new Error('Too many redirects while downloading image')
       if (!response.ok) {
         throw new Error(`Failed to download image: HTTP ${response.status}`)
       }
@@ -727,11 +798,26 @@ export class ProxyServer {
       if (!contentType || !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType)) {
         throw new Error(`Unsupported image content-type: ${contentType || 'unknown'}`)
       }
-      const arrayBuffer = await response.arrayBuffer()
-      if (arrayBuffer.byteLength > 10 * 1024 * 1024) {
+      const declared = parseInt(response.headers.get('content-length') || '0', 10)
+      if (Number.isFinite(declared) && declared > maxBytes) {
         throw new Error('Image exceeds 10MB limit')
       }
-      return `data:${contentType};base64,${Buffer.from(arrayBuffer).toString('base64')}`
+      // 边读边计数，超限立即中止，不先整体缓冲
+      const chunks: Uint8Array[] = []
+      let total = 0
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('Image response has no body')
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        total += value.byteLength
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => undefined)
+          throw new Error('Image exceeds 10MB limit')
+        }
+        chunks.push(value)
+      }
+      return `data:${contentType};base64,${Buffer.concat(chunks).toString('base64')}`
     } finally {
       clearTimeout(timeout)
       signal?.removeEventListener('abort', abort)
@@ -1149,31 +1235,32 @@ export class ProxyServer {
       }
     }
 
-    const task = this.doRefreshToken(account, signal)
-    this.refreshingTokens.set(account.id, task)
-    try {
-      return await task
-    } finally {
+    // 共享刷新任务不绑定任何单个请求的 signal：发起请求断开时，其它等待者仍能拿到真实结果
+    const task = this.doRefreshToken(account).finally(() => {
       this.refreshingTokens.delete(account.id)
-    }
+    })
+    this.refreshingTokens.set(account.id, task)
+    return await this.abortable(task, signal)
   }
 
   /** 实际执行 Token 刷新（由 refreshToken 包裹在途去重后调用） */
-  private async doRefreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<boolean> {
+  private async doRefreshToken(account: ProxyAccount): Promise<boolean> {
     console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}`)
 
     try {
       // 随机延迟 0-3 秒，避免多账号同时刷新被识别为批量操作
       const jitter = Math.floor(Math.random() * 3000)
-      if (jitter > 0) await this.waitForRetry(jitter, signal)
+      if (jitter > 0) await this.waitForRetry(jitter)
       
-      const result = await this.abortable(this.events.onTokenRefresh!(account), signal)
+      const result = await this.events.onTokenRefresh!(account)
       if (result.success && result.accessToken) {
         // 更新账号池中的 Token
         this.accountPool.updateAccount(account.id, {
           accessToken: result.accessToken,
           refreshToken: result.refreshToken || account.refreshToken,
-          expiresAt: result.expiresAt
+          expiresAt: result.expiresAt,
+          isAvailable: true,
+          refreshFailedAt: undefined
         })
         // 通知外部更新
         this.events.onAccountUpdate?.({
@@ -1190,7 +1277,6 @@ export class ProxyServer {
         return false
       }
     } catch (error) {
-      if (this.isAbortError(error, signal)) throw error
       console.error(`[ProxyServer] Token refresh error for ${account.email || account.id}:`, error)
       this.accountPool.markNeedsRefresh(account.id)
       return false
@@ -1211,13 +1297,13 @@ export class ProxyServer {
   // 获取可用账号（包含 Token 刷新检查）
   // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
   // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
-  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
+  // 账号是否满足 API Key 白名单（apiKeyAccountBindings）与分组过滤
+  private buildAccountFilter(apiKeyId?: string): (acc: ProxyAccount | null) => boolean {
     const allowedIds = this.getAllowedAccountIds(apiKeyId)
     const groupMode = this.config.multiAccountSelectionMode === 'groups'
     const allowedGroupIds = groupMode ? new Set(this.config.multiAccountGroupIds || []) : null
-    const isAllowed = (acc: ProxyAccount | null): boolean => {
+    return (acc) => {
       if (!acc) return true
-      // API Key 白名单（apiKeyAccountBindings）
       if (allowedIds && !allowedIds.has(acc.id)) return false
       // 分组过滤（双保险：即便前端忘了重新同步账号池，这里也能拦住非选中分组的账号）
       if (groupMode && allowedGroupIds) {
@@ -1226,6 +1312,11 @@ export class ProxyServer {
       }
       return true
     }
+  }
+
+  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
+    setRequestApiKeyId(apiKeyId)
+    const isAllowed = this.buildAccountFilter(apiKeyId)
     this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
     if (this.accountPool.size === 0 && this.events.onPoolEmpty) {
@@ -1356,23 +1447,49 @@ export class ProxyServer {
 
   // 上游过载/瞬时 5xx（问题清单 #8「MODEL_TEMPORARILY_UNAVAILABLE / high load」）
   private isUpstreamOverloadError(errMsg: string): boolean {
-    return /model_temporarily_unavailable|high load|overloaded|throttlingexception/i.test(errMsg) || /\b50[0234]\b/.test(errMsg)
+    const status = this.extractHttpStatus(errMsg)
+    if (status !== undefined && [500, 502, 503, 504].includes(status)) return true
+    return /model_temporarily_unavailable|high load|overloaded|throttlingexception/i.test(errMsg)
+  }
+
+  // 从错误文本取 HTTP 状态码：只认 kiroApi 抛出的 "Auth error <code>:" / "API error <code>:" /
+  // "... (429)" 前缀，不扫描上游 body，避免 body 里的请求 ID 等数字被当成状态码
+  private extractHttpStatus(errMsg: string): number | undefined {
+    const m = errMsg.match(/^(?:Auth|API) error (\d{3})\b/) || errMsg.match(/^Quota exhausted on [^(]*\((\d{3})\)/)
+    return m ? parseInt(m[1], 10) : undefined
+  }
+
+  private isAuthErrorMessage(errMsg: string): boolean {
+    const status = this.extractHttpStatus(errMsg)
+    if (status !== undefined) return status === 401 || status === 403
+    return errMsg.startsWith('Auth error')
   }
 
   // 402/429 配额/限流类错误（callWithRetry 与流式重试共用同一关键词集合）
   private isQuotaThrottleError(errMsg: string): boolean {
-    return errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')
+    const status = this.extractHttpStatus(errMsg)
+    if (status !== undefined) {
+      if (status === 402 || status === 429) return true
+      if (status === 401 || status === 403) return false
+    }
+    return /quota/i.test(errMsg) || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')
   }
 
   /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
   private pickFailoverAccount(triedIds: Set<string>): ProxyAccount | null {
-    if (this.config.enableMultiAccount) {
-      return this.accountPool.getNextAccount(triedIds)
+    if (!this.config.enableMultiAccount && !this.config.autoSwitchOnQuotaExhausted) return null
+
+    // 不满足 API Key 白名单 / 分组限制的账号不能作为故障转移目标
+    const isAllowed = this.buildAccountFilter(getRequestContext()?.apiKeyId)
+    const exclude = new Set(triedIds)
+    for (const acc of this.accountPool.getAllAccounts()) {
+      if (!isAllowed(acc)) exclude.add(acc.id)
     }
-    if (this.config.autoSwitchOnQuotaExhausted) {
-      return this.accountPool.getNextAvailableAccount(triedIds)
-    }
-    return null
+
+    const next = this.config.enableMultiAccount
+      ? this.accountPool.getNextAccount(exclude)
+      : this.accountPool.getNextAvailableAccount(exclude)
+    return next && isAllowed(next) ? next : null
   }
 
   /**
@@ -1433,7 +1550,7 @@ export class ProxyServer {
     }
 
     // 2) 401/403: 尝试刷新 Token 同号重试；刷新失败切号
-    if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
+    if (this.isAuthErrorMessage(errMsg)) {
       const refreshed = await this.refreshToken(currentAccount, signal)
       if (refreshed) {
         return { account: this.accountPool.getAccount(currentAccount.id) || currentAccount, delayMs: 0 }
@@ -1481,7 +1598,7 @@ export class ProxyServer {
   // 带重试的 API 调用
   private async callWithRetry<T>(
     account: ProxyAccount,
-    apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
+    apiCall: (acc: ProxyAccount) => Promise<T>,
     _path: string,
     signal?: AbortSignal
   ): Promise<{ result: T; account: ProxyAccount }> {
@@ -1489,14 +1606,13 @@ export class ProxyServer {
     const retryDelay = this.config.retryDelayMs || 1000
     let lastError: Error | null = null
     let currentAccount = account
-    let endpointIndex = 0
     // 本次请求累计已尝试的账号 ID，避免重试时循环命中已经失败过的账号
     const triedIds = new Set<string>([account.id])
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       this.throwIfAborted(signal)
       try {
-        const result = await apiCall(currentAccount, endpointIndex)
+        const result = await apiCall(currentAccount)
         return { result, account: currentAccount }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
@@ -1552,7 +1668,7 @@ export class ProxyServer {
         }
 
         // 401/403: 尝试刷新 Token
-        if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
+        if (this.isAuthErrorMessage(errMsg)) {
           console.log('[ProxyServer] Auth error, attempting token refresh')
           const refreshed = await this.refreshToken(currentAccount, signal)
           if (refreshed) {
@@ -1568,25 +1684,23 @@ export class ProxyServer {
           }
         }
 
-        // 402/429: 额度耗尽，切换端点或账号
+        // 402/429: 端点轮换已在 callKiroApiStream 内完成，这里只需换号
         if (this.isQuotaThrottleError(errMsg)) {
-          console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
-          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
-          endpointIndex = (endpointIndex + 1) % 2 // 切换端点
-          if (endpointIndex === 0) {
-            // 已尝试所有端点，切换到没试过的下个账号
-            const nextAccount = this.pickFailoverAccount(triedIds)
-            if (nextAccount && !triedIds.has(nextAccount.id)) {
-              console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
-              currentAccount = nextAccount
-              triedIds.add(nextAccount.id)
-              if (!this.config.enableMultiAccount) {
-                this.config.selectedAccountIds = [nextAccount.id]
-                this.events.onAccountUpdate?.(nextAccount)
-              }
+          console.log('[ProxyServer] Quota/throttle error, switching account')
+          const nextAccount = this.pickFailoverAccount(triedIds)
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            // 仅在本函数消化掉这次失败（换号继续）时记账；无号可切时由 handleApiError 统一记账
+            this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+            console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            if (!this.config.enableMultiAccount) {
+              this.config.selectedAccountIds = [nextAccount.id]
+              this.events.onAccountUpdate?.(nextAccount)
             }
+            continue
           }
-          continue
+          break
         }
 
         // 上游过载(5xx/MODEL_TEMPORARILY_UNAVAILABLE)/网络瞬时错误(fetch failed 等):
@@ -1612,7 +1726,9 @@ export class ProxyServer {
       }
     }
 
-    throw lastError || new Error('Unknown error')
+    const finalError = lastError || new Error('Unknown error')
+    ;(finalError as Error & { failedAccountId?: string }).failedAccountId = currentAccount.id
+    throw finalError
   }
 
   /**
@@ -2024,8 +2140,13 @@ export class ProxyServer {
       // P0-1 body 超限 → 413
       if (error instanceof BodyTooLargeError) {
         proxyLogger.warn('ProxyServer', `Body too large from ${clientIP}: ${error.received}/${error.limit} bytes (${path})`)
+        res.setHeader('Connection', 'close')
         this.sendError(res, 413, `Request body too large (max ${error.limit} bytes)`,
           this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+        return
+      }
+      if (error instanceof InvalidJsonBodyError) {
+        this.sendError(res, 400, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
         return
       }
       // P0-5 错误响应 sanitize：500 类不吐内部 message
@@ -2084,8 +2205,9 @@ export class ProxyServer {
   private async handleAdminApi(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
     const method = req.method || 'GET'
 
-    // 管理 API 需要 API Key 验证
-    const authResult = this.validateApiKey(req)
+    // 管理 API 必须配置并携带 API Key；未配置任何 Key 时一律拒绝
+    const hasConfiguredKey = !!this.config.apiKey || (this.config.apiKeys?.some((k) => k.enabled && !!k.key) ?? false)
+    const authResult = hasConfiguredKey ? this.validateApiKey(req) : { valid: false }
     if (!authResult.valid) {
       this.sendError(res, 401, 'Admin API requires authentication')
       return
@@ -2108,7 +2230,15 @@ export class ProxyServer {
         this.sendError(res, 400, 'Invalid JSON body')
         return
       }
-      const safeUpdate = this.filterAdminConfigUpdate(parsed)
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        this.sendError(res, 400, 'Config body must be a JSON object')
+        return
+      }
+      const { update: safeUpdate, rejected } = this.filterAdminConfigUpdate(parsed)
+      if (rejected.length > 0) {
+        this.sendError(res, 400, `Invalid value type or range for: ${rejected.join(', ')}`)
+        return
+      }
       this.updateConfig(safeUpdate)
       this.appendAuditLog('config_updated', { fields: Object.keys(safeUpdate) })
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -2203,28 +2333,50 @@ export class ProxyServer {
    * P1-9 admin/config POST 字段白名单过滤
    * 仅允许"可远程改"的字段；apiKeys/apiKey 等敏感字段必须通过本地 IPC 改
    */
-  private filterAdminConfigUpdate(input: Record<string, unknown>): Partial<ProxyConfig> {
-    const allowed: Array<keyof ProxyConfig> = [
-      'enabled', 'enableMultiAccount', 'logRequests', 'logStreamEvents',
-      'maxConcurrent', 'maxRetries', 'retryDelayMs', 'preferredEndpoint',
-      'tokenRefreshBeforeExpiry', 'autoStart', 'clientDrivenToolExecution',
-      'disableTools', 'payloadSizeLimitKB', 'enableTokenBufferReserve',
-      'tokenBufferReserve', 'autoSwitchOnQuotaExhausted', 'accountSelectionStrategy',
-      'multiAccountSelectionMode', 'multiAccountGroupIds', 'modelMappings',
-      'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
-      'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
-      'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
+  private filterAdminConfigUpdate(input: Record<string, unknown>): { update: Partial<ProxyConfig>; rejected: string[] } {
+    const isBool = (v: unknown): boolean => typeof v === 'boolean'
+    const isNum = (min: number, max: number) => (v: unknown): boolean =>
+      typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max
+    const isEnum = (...values: string[]) => (v: unknown): boolean => typeof v === 'string' && values.includes(v)
+    const isStrArr = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string')
+    const isModelMappings = (v: unknown): boolean =>
+      Array.isArray(v) && v.every((x) => {
+        const r = x as Record<string, unknown> | null
+        return r !== null && typeof r === 'object' && typeof r.sourceModel === 'string' && isStrArr(r.targetModels)
+      })
+    const isGroupBindings = (v: unknown): boolean =>
+      v !== null && typeof v === 'object' && !Array.isArray(v)
+      && Object.values(v as Record<string, unknown>).every(isStrArr)
+
+    const validators: Partial<Record<keyof ProxyConfig, (v: unknown) => boolean>> = {
+      enabled: isBool, enableMultiAccount: isBool, logRequests: isBool, logStreamEvents: isBool,
+      maxConcurrent: isNum(1, 10_000), maxRetries: isNum(0, 20), retryDelayMs: isNum(0, 600_000),
+      preferredEndpoint: isEnum('codewhisperer', 'amazonq', 'amazonq-cli'),
+      tokenRefreshBeforeExpiry: isNum(0, 86_400), autoStart: isBool, clientDrivenToolExecution: isBool,
+      disableTools: isBool, payloadSizeLimitKB: isNum(1, 1_048_576), enableTokenBufferReserve: isBool,
+      tokenBufferReserve: isNum(0, 10_000_000), autoSwitchOnQuotaExhausted: isBool,
+      accountSelectionStrategy: isEnum('round-robin', 'sticky'),
+      multiAccountSelectionMode: isEnum('all', 'groups'), multiAccountGroupIds: isStrArr,
+      modelMappings: isModelMappings,
+      maxRequestBodyBytes: isNum(1024, 1_073_741_824), allowedIPs: isStrArr, deniedIPs: isStrArr,
+      rateLimitPerKeyPerMinute: isNum(0, 1_000_000), sessionAffinityEnabled: isBool,
+      keepAliveTimeoutMs: isNum(0, 3_600_000), headersTimeoutMs: isNum(0, 3_600_000),
+      recentRequestsLimit: isNum(0, 100_000), enableMetrics: isBool,
+      apiKeyGroupBindings: isGroupBindings, enableAuditLog: isBool
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
-    ]
-    const out: Partial<ProxyConfig> = {}
-    for (const key of allowed) {
-      if (key in input) {
-        (out as Record<string, unknown>)[key] = input[key as string]
+    }
+    const update: Partial<ProxyConfig> = {}
+    const rejected: string[] = []
+    for (const [key, validate] of Object.entries(validators) as Array<[keyof ProxyConfig, (v: unknown) => boolean]>) {
+      if (!(key in input)) continue
+      if (validate(input[key as string])) {
+        (update as Record<string, unknown>)[key] = input[key as string]
+      } else {
+        rejected.push(key)
       }
     }
-    return out
+    return { update, rejected }
   }
 
   // 管理 API - 日志
@@ -2649,7 +2801,8 @@ export class ProxyServer {
   private async handleOpenAIChat(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
-    const request: OpenAIChatRequest = JSON.parse(body)
+    let request: OpenAIChatRequest
+    try { request = JSON.parse(body) } catch { throw new InvalidJsonBodyError() }
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
@@ -3127,8 +3280,8 @@ export class ProxyServer {
         res.end()
 
         this.recordRequestFailed()
-        const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-        this.accountPool.recordError(failedAccount.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+        const errStatusCode = this.extractHttpStatus(error.message)
+        this.accountPool.recordError(failedAccount.id, errStatusCode ? classifyError(errStatusCode) : ErrorType.RECOVERABLE, errStatusCode)
         this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
         this.recordRequest({ path: '/v1/chat/completions', model, accountId: failedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
         resolve()
@@ -3142,7 +3295,8 @@ export class ProxyServer {
   private async handleClaudeMessages(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
-    const request: ClaudeRequest = JSON.parse(body)
+    let request: ClaudeRequest
+    try { request = JSON.parse(body) } catch { throw new InvalidJsonBodyError() }
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
@@ -3618,8 +3772,8 @@ export class ProxyServer {
         res.end()
 
         this.recordRequestFailed()
-        const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-        this.accountPool.recordError(failedAccount.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+        const errStatusCode2 = this.extractHttpStatus(error.message)
+        this.accountPool.recordError(failedAccount.id, errStatusCode2 ? classifyError(errStatusCode2) : ErrorType.RECOVERABLE, errStatusCode2)
         this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
         this.recordRequest({ path: '/v1/messages', model, accountId: failedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
         resolve()
@@ -3630,13 +3784,15 @@ export class ProxyServer {
   }
 
   // 处理 API 错误
-  private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
+  private handleApiError(res: http.ServerResponse, initialAccount: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
+    // callWithRetry 故障转移后，失败发生在最后尝试的账号上，而不是最初选中的账号
+    const failedAccountId = (error as Error & { failedAccountId?: string }).failedAccountId
+    const account = failedAccountId ? { id: failedAccountId } : initialAccount
     this.recordRequestFailed()
-    const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = errCode ? parseInt(errCode) : 500
+    const parsedCode = this.extractHttpStatus(error.message) ?? 500
     const errorType = classifyError(parsedCode)
-    const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
+    const isAuthError = this.isAuthErrorMessage(error.message)
 
     this.accountPool.recordError(account.id, errorType, parsedCode)
 
@@ -3690,7 +3846,10 @@ export class ProxyServer {
         total += chunk.length
         if (total > maxBytes) {
           cleanup()
-          try { req.destroy() } catch { /* ignore */ }
+          // 不能立刻 destroy：socket 一断，上层写回的 413 就到不了客户端。
+          // 停止缓冲并丢弃后续数据，响应发出后由 Connection: close 收尾。
+          chunks.length = 0
+          req.on('data', () => undefined)
           reject(new BodyTooLargeError(total, maxBytes))
           return
         }

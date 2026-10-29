@@ -118,7 +118,7 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      const agent = safeCreateProxyAgent(proxyUrl, { insecureTls: true })
       if (agent) return agent
     }
   }
@@ -142,6 +142,9 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
   }
   return await fetch(url, options)
 }
+
+// 单个 Event Stream 帧的长度上限，防止畸形长度让缓冲区无限增长
+const MAX_EVENT_FRAME_BYTES = 16 * 1024 * 1024
 
 // Kiro API 端点配置
 const KIRO_ENDPOINTS = [
@@ -1272,10 +1275,19 @@ export async function callKiroApiStream(
 
   // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底，流式端点自动不传占位符）
   if (isEnterprise && !storedProfileArnMatchesRegion(account)) {
-    const fetchedArn = await fetchEnterpriseProfileArn(account)
-    if (fetchedArn) {
-      account.profileArn = fetchedArn
-      if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
+    const probeKey = profileProbeKey(account)
+    const failedAt = profileProbeFailedAt.get(probeKey)
+    if (failedAt === undefined || Date.now() - failedAt >= PROFILE_PROBE_FAIL_TTL_MS) {
+      throwIfAborted(signal)
+      const fetchedArn = await fetchEnterpriseProfileArn(account)
+      if (fetchedArn) {
+        profileProbeFailedAt.delete(probeKey)
+        account.profileArn = fetchedArn
+        if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
+      } else {
+        profileProbeFailedAt.set(probeKey, Date.now())
+      }
+      throwIfAborted(signal)
     }
   }
 
@@ -1346,7 +1358,7 @@ export async function callKiroApiStream(
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
-        lastError = new Error(`Quota exhausted on ${endpoint.name}`)
+        lastError = new Error(`Quota exhausted on ${endpoint.name} (429)`)
         continue
       }
 
@@ -1769,7 +1781,13 @@ async function parseEventStream(
         // - 4 bytes: message CRC
 
         const totalLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(0, false)
-        
+
+        // 帧最小长度 = 12 字节 prelude + 4 字节 message CRC；更小说明流已损坏，
+        // 继续按它切片会因 slice(0) 不前进而死循环
+        if (totalLength < 16 || totalLength > MAX_EVENT_FRAME_BYTES) {
+          throw new Error(`Malformed event stream frame (length=${totalLength})`)
+        }
+
         if (buffer.length < totalLength) {
           break // 等待更多数据
         }
@@ -2295,6 +2313,8 @@ async function parseEventStream(
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
     onComplete(usage)
   } catch (error) {
+    // 解析出错时主动取消上游读取，否则非 abort 错误下连接会一直挂着
+    reader.cancel().catch(() => undefined)
     onError(signal?.aborted ? getAbortError(signal) : error as Error)
   } finally {
     signal?.removeEventListener('abort', abort)
@@ -2407,6 +2427,15 @@ function getCodeWhispererEndpoint(region?: string): string {
  * 都会得到空列表，但语义相反——前者是"不知道"，后者是"确认没有"。调用方必须区分，
  * 否则探测失败会被误判成该区域无 profile，从而回落到别区域的 ARN（→ 400 Invalid profileArn）。
  */
+// Enterprise profileArn 探测失败的短时负缓存：失败后一段时间内不再探测，
+// 否则每个流式请求都会先多发 1-2 个必然失败的 ListAvailableProfiles
+const PROFILE_PROBE_FAIL_TTL_MS = 60_000
+const profileProbeFailedAt = new Map<string, number>()
+
+function profileProbeKey(account: ProxyAccount): string {
+  return `${account.id}|${regionHost(getApiRegion(account))}|${(account.accessToken || '').slice(-12)}`
+}
+
 async function listAvailableProfiles(
   baseUrl: string,
   account: ProxyAccount,

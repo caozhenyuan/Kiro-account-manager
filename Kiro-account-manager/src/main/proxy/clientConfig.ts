@@ -414,6 +414,23 @@ function getHermesConfigPath(): string {
   return join(homedir(), '.hermes', 'config.yaml')
 }
 
+// 替换 YAML 列表里以 startPattern 开头的整个条目（含其缩进更深的所有后续行）；找不到返回 null
+function replaceYamlListItem(content: string, startPattern: RegExp, block: string, newline: string): string | null {
+  const lines = content.split(/\r?\n/)
+  const start = lines.findIndex((l) => startPattern.test(l))
+  if (start === -1) return null
+  const indent = (lines[start].match(/^\s*/) as RegExpMatchArray)[0].length
+  let end = start + 1
+  while (end < lines.length) {
+    const line = lines[end]
+    if (line.trim() !== '' && (line.match(/^\s*/) as RegExpMatchArray)[0].length <= indent) break
+    end++
+  }
+  while (end > start + 1 && lines[end - 1].trim() === '') end--
+  lines.splice(start, end - start, ...block.split(newline))
+  return lines.join(newline)
+}
+
 async function configureHermes(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const configPath = getHermesConfigPath()
   const existing = (await exists(configPath)) ? await readFile(configPath, 'utf-8') : ''
@@ -434,11 +451,11 @@ async function configureHermes(context: ProxyClientContext): Promise<Omit<ProxyC
     modelsYaml
   ].join(newline)
 
-  // 简单追加/替换 custom_providers 中的 kiro 条目
+  // 追加/替换 custom_providers 中的 kiro 条目
   let content = existing
-  const kiroProviderRegex = /^\s*- name:\s*kiro\b[\s\S]*?(?=^\s*- name:|^[a-z]|$)/gm
-  if (kiroProviderRegex.test(content)) {
-    content = content.replace(kiroProviderRegex, providerBlock + newline)
+  const replaced = replaceYamlListItem(content, /^\s*- name:\s*kiro\b/, providerBlock, newline)
+  if (replaced !== null) {
+    content = replaced
   } else if (content.includes('custom_providers:')) {
     content = content.replace(/(custom_providers:\s*)/, `$1${newline}${providerBlock}${newline}`)
   } else {

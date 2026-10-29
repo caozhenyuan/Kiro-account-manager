@@ -19,7 +19,7 @@ export interface OpenAIChatRequest {
 }
 
 export interface OpenAIMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool'
+  role: 'system' | 'developer' | 'user' | 'assistant' | 'tool'
   content: string | OpenAIContentPart[]
   reasoning_content?: string
   name?: string
@@ -122,7 +122,7 @@ export interface OpenAIResponsesRequest {
 
 export interface OpenAIResponseInputItem {
   type?: 'message' | 'function_call' | 'function_call_output'
-  role?: 'system' | 'user' | 'assistant' | 'tool'
+  role?: 'system' | 'developer' | 'user' | 'assistant' | 'tool'
   content?: string | OpenAIResponseContentPart[]
   call_id?: string
   name?: string
@@ -201,6 +201,7 @@ export interface ClaudeContentBlock {
   name?: string
   input?: unknown
   tool_use_id?: string
+  is_error?: boolean
   content?: string | ClaudeContentBlock[]
   cache_control?: ClaudeCacheControl
 }
@@ -403,6 +404,8 @@ export interface ProxyAccount {
   requestCount?: number
   errorCount?: number
   isAvailable?: boolean
+  /** 最近一次 Token 刷新失败的时间；超过基础冷却后允许再次探测 */
+  refreshFailedAt?: number
   cooldownUntil?: number
   // 配额追踪
   quotaUsed?: number

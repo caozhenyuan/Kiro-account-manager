@@ -215,7 +215,9 @@ export class AccountPool {
     }
 
     if (account.isAvailable === false) {
-      return false
+      // 刷新失败的账号过了基础冷却后放行一次探测，成功后由 recordSuccess 恢复
+      const retryable = account.refreshFailedAt && now - account.refreshFailedAt >= this.config.baseCooldownMs
+      if (!retryable) return false
     }
 
     // 断路器检查：指数退避 + 概率重试
@@ -300,18 +302,32 @@ export class AccountPool {
     return false
   }
 
-  // 获取冷却时间最短的账号
+  // 获取最先可恢复的账号：跳过被封禁账号；等待时间取断路器剩余退避与 cooldownUntil 的较大者；
+  // 因 Token 刷新失败而不可用的账号排在其它账号之后
   private getAccountWithShortestCooldown(accounts: ProxyAccount[], now: number): ProxyAccount | null {
     let bestAccount: ProxyAccount | null = null
+    let bestNeedsRefresh = true
     let shortestWait = Infinity
 
     for (const account of accounts) {
-      const cooldownUntil = account.cooldownUntil || 0
-      const wait = Math.max(0, cooldownUntil - now)
-      
-      if (wait < shortestWait) {
-        shortestWait = wait
+      if (this.isSuspended(account)) continue
+
+      const failures = account.errorCount || 0
+      let breakerWait = 0
+      if (failures > 0 && account.lastUsed) {
+        const multiplier = Math.min(Math.pow(2, failures - 1), this.config.maxBackoffMultiplier)
+        breakerWait = Math.max(0, account.lastUsed + this.config.baseCooldownMs * multiplier - now)
+      }
+      const wait = Math.max(breakerWait, (account.cooldownUntil || 0) - now, 0)
+      const needsRefresh = account.isAvailable === false
+
+      const better = bestAccount === null
+        || (bestNeedsRefresh && !needsRefresh)
+        || (bestNeedsRefresh === needsRefresh && wait < shortestWait)
+      if (better) {
         bestAccount = account
+        bestNeedsRefresh = needsRefresh
+        shortestWait = wait
       }
     }
 
@@ -327,7 +343,8 @@ export class AccountPool {
         requestCount: (account.requestCount || 0) + 1,
         errorCount: 0, // 重置断路器失败计数
         lastUsed: Date.now(),
-        isAvailable: true
+        isAvailable: true,
+        refreshFailedAt: undefined
       })
 
       const accountList = Array.from(this.accounts.keys())
@@ -452,7 +469,8 @@ export class AccountPool {
     if (account) {
       this.accounts.set(accountId, {
         ...account,
-        isAvailable: false
+        isAvailable: false,
+        refreshFailedAt: Date.now()
       })
     }
   }
@@ -485,6 +503,7 @@ export class AccountPool {
       this.accounts.set(id, {
         ...account,
         isAvailable: true,
+        refreshFailedAt: undefined,
         errorCount: 0,
         cooldownUntil: undefined,
         quotaExhaustedAt: undefined,
