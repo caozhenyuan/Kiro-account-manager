@@ -264,6 +264,21 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.16 (2026-10-29) — Notice and Fixes When the Quota Query Falls Back to Another Region
+
+#### 🌍 Show Which Region the Usage Actually Came From When the Quota Region Fails
+
+- **Symptom**: for an Enterprise account with two quota regions, if the profile in the current quota region has been removed (for example, dropped from us-east-1 after going over its limit), refreshing the account showed the other region's usage (e.g. Frankfurt) while the quota region still read the original one, so it looked like "us-east-1 is used up"
+- **Cause**: when the usage query got a 403 in the current region it retried the other region and treated the result as the current region's data; the retry also still carried the original region's profileArn, which sometimes returned 400 `Improperly formed request`
+- **Fix**: the fallback request no longer carries the original region's profileArn, and the result now records the region that actually served it. When the two differ, the account card and list show "us-east-1 unavailable, showing eu-central-1 quota", and one click switches the quota region to that region and re-queries. Proxy routing is unaffected and still uses the configured quota region
+
+#### 📊 Monthly Quota Analysis No Longer Double-Counts Fallback Quota
+
+- Usage snapshots are recorded under the region that actually served the data, and region names are normalized to us-east-1 / eu-central-1, so the same quota is not counted twice during a fallback or after switching regions
+- Un-normalized snapshots written by v1.7.15 (e.g. eu-west-1) are treated as eu-central-1, so nothing needs to be cleaned up after upgrading
+
+---
+
 ### v1.7.15 (2026-10-26) — Monthly Quota Dashboard + Quota Region Fix + Render Error Boundary
 
 #### 📊 New "Monthly Quota Analysis" Dashboard on the Home Page
