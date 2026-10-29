@@ -162,7 +162,8 @@ export function buildTrend(
   for (const key of keys) {
     let used = 0
     let has = false
-    for (const [id, snap] of Object.entries(history[key])) {
+    for (const [rawId, snap] of Object.entries(history[key])) {
+      const id = normalizeKey(rawId)
       const prev = lastSeen.get(id)
       lastSeen.set(id, snap.c)
       if (prev === undefined) continue
@@ -189,9 +190,22 @@ export function snapshotKey(id: string, region: string): string {
   return `${id}|${region}`
 }
 
-/** 与反代 getApiRegion 同口径：apiRegion → region → us-east-1 */
-export function apiRegionOf(a: Account): string {
-  return a.credentials?.apiRegion || a.credentials?.region || 'us-east-1'
+/** Kiro 后端只有 us-east-1 / eu-central-1 两个额度端点，其它区域按前缀归一 */
+export function regionHost(region: string): string {
+  return region.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+}
+
+/** 这份用量实际所属的额度区域（与主进程 usageHistory.usageRegionOf 一致） */
+export function usageRegionOf(a: Account): string {
+  return regionHost(
+    a.usage?.servedRegion || a.credentials?.apiRegion || a.credentials?.region || 'us-east-1'
+  )
+}
+
+/** 把快照键里的区域归一到端点区域；无区域的旧键原样返回 */
+function normalizeKey(key: string): string {
+  const cut = key.lastIndexOf('|')
+  return cut < 0 ? key : snapshotKey(key.slice(0, cut), regionHost(key.slice(cut + 1)))
 }
 
 interface QuotaEntry {
@@ -210,21 +224,18 @@ interface QuotaEntry {
  * 对每个正常账号，找出它在「其它额度区域」的最近一次快照。
  * 仅当快照记录的重置日仍在未来（仍属本周期）才采用，过期的额度视为已重置、不再计入。
  */
-function otherRegionEntries(
-  accounts: Account[],
-  history: UsageHistory,
-  now: Date
-): QuotaEntry[] {
+function otherRegionEntries(accounts: Account[], history: UsageHistory, now: Date): QuotaEntry[] {
   const byId = new Map(accounts.map((a) => [a.id, a]))
   const latest = new Map<string, { day: string; snap: AccountDaySnapshot }>()
   for (const day of Object.keys(history).sort()) {
-    for (const [key, snap] of Object.entries(history[day])) {
+    for (const [rawKey, snap] of Object.entries(history[day])) {
+      const key = normalizeKey(rawKey)
       const cut = key.lastIndexOf('|')
       if (cut < 0) continue
       const id = key.slice(0, cut)
       const region = key.slice(cut + 1)
       const acc = byId.get(id)
-      if (!acc || region === apiRegionOf(acc)) continue
+      if (!acc || region === usageRegionOf(acc)) continue
       latest.set(key, { day, snap })
     }
   }

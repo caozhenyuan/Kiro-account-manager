@@ -53,6 +53,8 @@ export interface AccountUsage {
   freeTrialExpiry?: string
   bonuses?: BonusUsage[]  // 奖励额度列表
   nextResetDate?: string  // 重置日期
+  /** 本次用量实际来自的额度区域；与账号额度区域不同说明该区域查询失败、回落到了另一区域 */
+  servedRegion?: string
   resourceDetail?: ResourceDetail // 资源详情
 }
 

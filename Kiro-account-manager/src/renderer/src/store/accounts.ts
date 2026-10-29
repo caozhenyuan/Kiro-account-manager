@@ -181,6 +181,7 @@ async function syncLocalSsoAccountAsync(
         freeTrialExpiry: verifyResult.data.usage.freeTrialExpiry,
         bonuses: verifyResult.data.usage.bonuses,
         nextResetDate: verifyResult.data.usage.nextResetDate,
+        servedRegion: verifyResult.data.usage.servedRegion,
         resourceDetail: verifyResult.data.usage.resourceDetail
       },
       status: 'active',
@@ -1508,6 +1509,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               freeTrialExpiry: apiUsage.freeTrialExpiry,
               bonuses: apiUsage.bonuses,
               nextResetDate: apiUsage.nextResetDate,
+              servedRegion: apiUsage.servedRegion,
               resourceDetail: apiUsage.resourceDetail
             } : acc.usage
 
@@ -2511,6 +2513,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           freeTrialExpiry?: string
           bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
           nextResetDate?: string
+          servedRegion?: string
           resourceDetail?: {
             displayName?: string
             displayNamePlural?: string
@@ -2559,6 +2562,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             freeTrialExpiry: refreshData.usage.freeTrialExpiry ?? account.usage.freeTrialExpiry,
             bonuses: refreshData.usage.bonuses ?? account.usage.bonuses,
             nextResetDate: refreshData.usage.nextResetDate ?? account.usage.nextResetDate,
+            servedRegion: refreshData.usage.servedRegion,
             resourceDetail: refreshData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
           }
@@ -2626,6 +2630,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           freeTrialExpiry?: string
           bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
           nextResetDate?: string
+          servedRegion?: string
           resourceDetail?: {
             displayName?: string
             displayNamePlural?: string
@@ -2670,6 +2675,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             freeTrialExpiry: checkData.usage.freeTrialExpiry ?? account.usage.freeTrialExpiry,
             bonuses: checkData.usage.bonuses ?? account.usage.bonuses,
             nextResetDate: checkData.usage.nextResetDate ?? account.usage.nextResetDate,
+            servedRegion: checkData.usage.servedRegion,
             resourceDetail: checkData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
           }

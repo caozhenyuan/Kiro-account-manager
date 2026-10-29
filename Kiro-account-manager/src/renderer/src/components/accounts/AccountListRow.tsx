@@ -21,6 +21,7 @@ import {
   Copy
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { RegionMismatchNotice } from './RegionMismatchNotice'
 import {
   toRgba,
   generateRowGlowStyle,
@@ -457,7 +458,10 @@ function AccountListRowComponent({
       {/* === Credits 区（中右） === */}
       <div className="flex-shrink-0 w-40 flex flex-col gap-0.5 px-2">
         <div className="flex items-center justify-between text-[10px]">
-          <span className="text-muted-foreground">{isEn ? 'Usage' : '使用量'}</span>
+          <span className="flex items-center gap-1 min-w-0">
+            <span className="text-muted-foreground">{isEn ? 'Usage' : '使用量'}</span>
+            <RegionMismatchNotice account={account} isEn={isEn} compact className="text-[9px]" />
+          </span>
           <span className={cn(
             'font-mono font-medium tabular-nums',
             isCritical ? 'text-destructive' : isHighUsage ? 'text-warning' : 'text-foreground'

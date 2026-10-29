@@ -27,6 +27,7 @@ import {
   RotateCcw
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { RegionMismatchNotice } from './RegionMismatchNotice'
 
 // 解析 ARGB 颜色转换为 CSS rgba
 function toRgba(argbColor: string): string {
@@ -727,6 +728,7 @@ export const AccountCard = memo(function AccountCard({
                   </span>
                 )}
             </div>
+            <RegionMismatchNotice account={account} isEn={isEn} className="text-[10px] pt-0.5" />
         </div>
 
         {/* Detailed Quotas - Compact list */}

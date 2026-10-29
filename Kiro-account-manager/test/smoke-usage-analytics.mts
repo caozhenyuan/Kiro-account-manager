@@ -46,13 +46,19 @@ function account(
     title?: string
     email?: string
     region?: string
+    served?: string
   } = {}
 ): Account {
   return {
     id,
     email: over.email ?? `${id}@example.com`,
     status: over.status ?? 'active',
-    usage: { current: over.current ?? 0, limit: over.limit ?? 1000, nextResetDate: over.reset },
+    usage: {
+      current: over.current ?? 0,
+      limit: over.limit ?? 1000,
+      nextResetDate: over.reset,
+      servedRegion: over.served
+    },
     subscription: { type: over.type ?? 'Pro', title: over.title },
     credentials: { region: 'us-east-1', apiRegion: over.region }
   } as unknown as Account
@@ -410,9 +416,77 @@ async function main(): Promise<void> {
       }
     })
     check('键含额度区域（apiRegion 优先）', k('a', 'eu-central-1') in s, Object.keys(s).join())
-    check('无 apiRegion 回落登录区域', k('b', 'eu-west-1') in s, Object.keys(s).join())
+    check('无 apiRegion 回落登录区域，并归一到端点区域', k('b', 'eu-central-1') in s, Object.keys(s).join())
     check('都没有时回落 us-east-1', k('c', 'us-east-1') in s, Object.keys(s).join())
     check('订阅取套餐名', s[k('a', 'eu-central-1')].t === 'KIRO PRO+')
+  }
+
+  console.log('[smoke] 用量查询回落到另一区域')
+  {
+    const EU = 'eu-central-1'
+    const RESET = iso(2026, 11, 1)
+
+    // 额度区域仍是美东，但美东查询失败、数据来自法兰克福：快照记在法兰克福名下
+    const s = extractSnapshots({
+      accounts: {
+        a: {
+          status: 'active',
+          usage: { current: 10000, limit: 10000, nextResetDate: RESET, servedRegion: EU },
+          subscription: { title: 'KIRO POWER' },
+          credentials: { region: R, apiRegion: R }
+        }
+      }
+    })
+    check('回落数据记在实际区域', Object.keys(s).join() === k('a', EU), Object.keys(s).join())
+
+    // 回落期间：实时那份算法兰克福；历史里旧的美东快照（重置日未过）仍算另一份额度
+    const history: UsageHistory = {
+      '2026-10-18': { [k('a', R)]: { c: 15000, l: 15000, t: 'KIRO POWER', r: RESET, g: R } },
+      '2026-10-20': { [k('a', EU)]: { c: 10000, l: 10000, t: 'KIRO POWER', r: RESET, g: EU } }
+    }
+    const during = computeMonthlyAnalytics(
+      [account('a', { region: R, served: EU, current: 10000, limit: 10000, reset: RESET })],
+      history,
+      NOW
+    )
+    check(
+      '回落期间：法兰克福实时 + 美东快照，不重复计入法兰克福',
+      during.quotaCount === 2 && during.otherRegionCount === 1 && during.totalLimit === 25000,
+      JSON.stringify([during.quotaCount, during.otherRegionCount, during.totalLimit])
+    )
+
+    // 切到法兰克福后：结果与回落期间一致
+    const after = computeMonthlyAnalytics(
+      [account('a', { region: EU, served: EU, current: 10000, limit: 10000, reset: RESET })],
+      history,
+      NOW
+    )
+    check(
+      '切换后：总额度不变，法兰克福不重复计入',
+      after.quotaCount === 2 && after.totalLimit === 25000,
+      JSON.stringify([after.quotaCount, after.totalLimit])
+    )
+
+    // v1.7.15 留下的未归一旧键（eu-west-1）与当前区域 eu-central-1 视为同一区域
+    const legacy = computeMonthlyAnalytics(
+      [account('a', { region: EU, current: 15, limit: 2000, reset: RESET })],
+      { '2026-10-19': { [k('a', 'eu-west-1')]: { c: 10, l: 2000, r: RESET } } },
+      NOW
+    )
+    check(
+      '未归一的旧区域键不被当成另一份额度',
+      legacy.quotaCount === 1 && legacy.totalLimit === 2000,
+      JSON.stringify([legacy.quotaCount, legacy.totalLimit])
+    )
+    const legacyTrend = buildTrend(
+      {
+        '2026-10-19': { [k('a', 'eu-west-1')]: snap(10) },
+        '2026-10-20': { [k('a', EU)]: snap(15) }
+      },
+      NOW,
+      2
+    ).trend
+    check('未归一旧键与新键连续差分', legacyTrend[1].used === 5, String(legacyTrend[1].used))
   }
 
   console.log('[smoke] 历史存储落盘与恢复')

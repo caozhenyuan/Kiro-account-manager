@@ -113,6 +113,7 @@ interface StatusResult {
       freeTrialExpiry?: string
       bonuses?: BonusData[]
       nextResetDate?: string
+      servedRegion?: string
       resourceDetail?: ResourceDetail
     }
     subscription?: { 
@@ -298,6 +299,7 @@ interface KiroApi {
         freeTrialExpiry?: string
         bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
         nextResetDate?: string
+        servedRegion?: string
         resourceDetail?: {
           displayName?: string
           displayNamePlural?: string

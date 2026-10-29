@@ -1134,6 +1134,13 @@ interface UsageLimitsResponse {
     email?: string
     userId?: string
   }
+  /** 实际返回数据的端点区域；主端点 403 回落到另一区域时与请求的区域不同 */
+  servedRegion?: string
+}
+
+/** REST 端点 base URL → 区域名 */
+function restBaseRegion(base: string): string {
+  return Object.entries(KIRO_REST_API_ENDPOINTS).find(([, url]) => url === base)?.[0] ?? 'us-east-1'
 }
 
 // 辅助函数：将 Unix 时间戳（秒）或 ISO 字符串转换为 ISO 字符串
@@ -1196,12 +1203,19 @@ async function getUsageLimitsRest(
   const primaryBase = getRestApiBase(ssoRegion)
   const fallbackBase = getFallbackRestApiBase(ssoRegion)
   
+  let servedBase = primaryBase
   let response = await fetchRestApi(primaryBase, path, accessToken, machineId)
   
-  // 如果主端点返回 403，尝试备用端点
+  // 主端点 403 时尝试另一区域。另一区域返回的是该区域自己的额度（订阅、用量、重置日都不同），
+  // 所以用 servedRegion 标出数据实际来源，调用方据此判断是否与额度区域一致。
+  // 携带的 profileArn 属于主端点区域，带去另一区域必然 400，回落时去掉。
   if (response.status === 403) {
+    servedBase = fallbackBase
+    const fallbackParams = new URLSearchParams(params)
+    fallbackParams.delete('profileArn')
     console.log(`[Kiro REST API] Primary 403, fallback → ${fallbackBase}`)
-    response = await fetchRestApi(fallbackBase, path, accessToken, machineId)
+    const fallbackPath = `/getUsageLimits?${fallbackParams.toString()}`
+    response = await fetchRestApi(fallbackBase, fallbackPath, accessToken, machineId)
   }
   
   if (!response.ok) {
@@ -1210,7 +1224,13 @@ async function getUsageLimitsRest(
     throw new Error(`HTTP ${response.status}: ${errorText}`)
   }
   
-  const result = await response.json()
+  const result = (await response.json()) as UsageLimitsResponse
+  result.servedRegion = restBaseRegion(servedBase)
+  if (servedBase !== primaryBase) {
+    console.warn(
+      `[Kiro REST API] GetUsageLimits [${logTag}] served by ${result.servedRegion} instead of requested ${restBaseRegion(primaryBase)}`
+    )
+  }
   console.log(`[Kiro REST API] GetUsageLimits [${logTag}] → ${response.status}`, result)
   return result
 }
@@ -1268,6 +1288,7 @@ interface UnifiedUsageResponse {
     email?: string
     userId?: string
   }
+  servedRegion?: string
 }
 
 async function getUsageAndLimits(
@@ -1355,7 +1376,8 @@ async function getUsageAndLimits(
       nextDateReset: normalizeResetDate(result.nextDateReset),
       subscriptionInfo: result.subscriptionInfo,
       overageConfiguration: result.overageConfiguration,
-      userInfo: result.userInfo
+      userInfo: result.userInfo,
+      servedRegion: result.servedRegion
     }
   } else {
     // 使用 CBOR API (GetUserUsageAndLimits)
@@ -1417,7 +1439,8 @@ async function getUsageAndLimits(
           nextDateReset: normalizeResetDate(result.nextDateReset as unknown as number | string),
           subscriptionInfo: result.subscriptionInfo,
           overageConfiguration: result.overageConfiguration,
-          userInfo: result.userInfo
+          userInfo: result.userInfo,
+          servedRegion: result.servedRegion
         }
       }
       throw cborError
@@ -3624,6 +3647,7 @@ app.whenReady().then(async () => {
       overageConfiguration?: OverageConfiguration
       subscriptionInfo?: SubscriptionInfo
       userInfo?: UserInfo
+      servedRegion?: string
     }
 
     // 解析 API 响应的辅助函数
@@ -3729,6 +3753,7 @@ app.whenReady().then(async () => {
             freeTrialExpiry,
             bonuses: bonusesData,
             nextResetDate,
+            servedRegion: result.servedRegion,
             resourceDetail
           },
           subscription: {
@@ -4031,6 +4056,7 @@ app.whenReady().then(async () => {
               freeTrialExpiry?: string
               bonuses: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
               nextResetDate?: string
+              servedRegion?: string
               resourceDetail?: {
                 displayName?: string
                 displayNamePlural?: string
@@ -4079,6 +4105,7 @@ app.whenReady().then(async () => {
                 interface UsageResponse {
                   usageBreakdownList?: UsageBreakdownItem[]
                   nextDateReset?: string
+                  servedRegion?: string
                   subscriptionInfo?: {
                     subscriptionTitle?: string
                     type?: string
@@ -4156,6 +4183,7 @@ app.whenReady().then(async () => {
                   freeTrialExpiry,
                   bonuses,
                   nextResetDate: rawUsage.nextDateReset,
+                  servedRegion: rawUsage.servedRegion,
                   resourceDetail: creditUsage ? {
                     displayName: creditUsage.displayName,
                     displayNamePlural: (creditUsage as { displayNamePlural?: string }).displayNamePlural,
@@ -4373,6 +4401,7 @@ app.whenReady().then(async () => {
                   email?: string
                   userId?: string
                 }
+                servedRegion?: string
               }>,
               kiroApiRequest<{
                 email?: string
@@ -4399,6 +4428,7 @@ app.whenReady().then(async () => {
               freeTrialExpiry?: string
               bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
               nextResetDate?: string
+              servedRegion?: string
             } | null = null
             let subscriptionData: {
               type: string
@@ -4474,7 +4504,8 @@ app.whenReady().then(async () => {
                 freeTrialLimit,
                 freeTrialExpiry,
                 bonuses,
-                nextResetDate: rawUsage.nextDateReset
+                nextResetDate: rawUsage.nextDateReset,
+                servedRegion: rawUsage.servedRegion
               }
 
               // 解析资源详情（含超额信息）
@@ -4732,6 +4763,7 @@ app.whenReady().then(async () => {
       
       interface UsageResponse {
         nextDateReset?: string
+        servedRegion?: string
         usageBreakdownList?: UsageBreakdown[]
         subscriptionInfo?: { 
           subscriptionTitle?: string
@@ -4865,6 +4897,7 @@ app.whenReady().then(async () => {
             freeTrialExpiry,
             bonuses,
             nextResetDate,
+            servedRegion: usageResult.servedRegion,
             resourceDetail: creditUsage ? {
               displayName: creditUsage.displayName,
               displayNamePlural: creditUsage.displayNamePlural,

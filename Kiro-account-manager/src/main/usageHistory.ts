@@ -24,7 +24,7 @@ export type UsageHistory = Record<string, Record<string, AccountDaySnapshot>>
 
 interface AccountLike {
   status?: string
-  usage?: { current?: number; limit?: number; nextResetDate?: string }
+  usage?: { current?: number; limit?: number; nextResetDate?: string; servedRegion?: string }
   subscription?: { type?: string; title?: string }
   credentials?: { region?: string; apiRegion?: string }
 }
@@ -38,9 +38,16 @@ export function snapshotKey(id: string, region: string): string {
   return `${id}|${region}`
 }
 
-/** 与反代 getApiRegion 同口径：apiRegion → region → us-east-1 */
-export function apiRegionOf(acc: AccountLike): string {
-  return acc.credentials?.apiRegion || acc.credentials?.region || 'us-east-1'
+/** Kiro 后端只有 us-east-1 / eu-central-1 两个额度端点，其它区域按前缀归一 */
+export function regionHost(region: string): string {
+  return region.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+}
+
+/** 这份用量实际所属的额度区域：查询回落到另一区域时以实际返回区域为准 */
+export function usageRegionOf(acc: AccountLike): string {
+  return regionHost(
+    acc.usage?.servedRegion || acc.credentials?.apiRegion || acc.credentials?.region || 'us-east-1'
+  )
 }
 
 export function dayKey(date: Date): string {
@@ -60,7 +67,7 @@ export function extractSnapshots(data: unknown): Record<string, AccountDaySnapsh
     const limit = Number(acc.usage?.limit)
     const current = Number(acc.usage?.current)
     if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(current)) continue
-    const region = apiRegionOf(acc)
+    const region = usageRegionOf(acc)
     const snap: AccountDaySnapshot = { c: round2(current), l: round2(limit), g: region }
     const plan = acc.subscription?.title || acc.subscription?.type
     if (plan) snap.t = plan

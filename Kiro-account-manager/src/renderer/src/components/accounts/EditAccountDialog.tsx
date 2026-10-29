@@ -50,6 +50,7 @@ export function EditAccountDialog({
       freeTrialExpiry?: string
       bonuses?: { code: string; name: string; current: number; limit: number; expiresAt?: string }[]
       nextResetDate?: string
+      servedRegion?: string
     }
     daysRemaining?: number
     expiresAt?: number
@@ -218,7 +219,8 @@ export function EditAccountDialog({
         freeTrialCurrent: accountInfo.usage.freeTrialCurrent,
         freeTrialExpiry: accountInfo.usage.freeTrialExpiry,
         bonuses: accountInfo.usage.bonuses,
-        nextResetDate: accountInfo.usage.nextResetDate
+        nextResetDate: accountInfo.usage.nextResetDate,
+        servedRegion: accountInfo.usage.servedRegion
       },
       status: 'active'
     })
