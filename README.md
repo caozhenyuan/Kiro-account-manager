@@ -264,6 +264,17 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.8.1 (2026-11-03) — Proxy Restores Accounts from Usage Checks + Quota Region Reminder
+
+#### 🔁 Proxy
+
+- **Usage check results now update the proxy account pool**: background refresh, background check and manual check feed their usage result to the proxy. If base quota remains, or overage is enabled and below its cap, the "quota exhausted" mark is cleared immediately; if base quota is used up with overage off, the account is marked exhausted without waiting for a 402. Previously one 402 kept the account skipped for up to 1 hour even after overage was turned on
+- **Switching an account's quota region clears the old region's exhausted mark and failure count**
+
+#### 🔔 Reminders
+
+- **Quota region reminder**: new "Quota Region Reminder" setting (default 8000, 0 = off). When an account's current quota region reaches this usage, a desktop notification and a webhook (new event "Open next quota region") are sent, and the home "Attention Needed" card shows it. Each account/region/billing cycle is reminded once
+
 ### v1.8.0 (2026-10-29) — Full-Project Code Review Fixes: Security Hardening + Proxy Stability + Data Persistence
 
 #### 🔒 Security Hardening
