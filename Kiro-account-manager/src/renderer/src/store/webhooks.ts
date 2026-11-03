@@ -32,6 +32,7 @@ export type WebhookEvent =
   | 'register-success'     // 单账号注册成功
   | 'register-failed'      // 单账号注册失败
   | 'token-expired'        // Token 过期/刷新失败
+  | 'region-quota-reminder' // 当前额度区域已用达到提醒值，需开通下一个区域
 
 export const ALL_WEBHOOK_EVENTS: { value: WebhookEvent; label: string; labelEn: string }[] = [
   { value: 'batch-completed', label: '批量任务完成', labelEn: 'Batch completed' },
@@ -40,7 +41,8 @@ export const ALL_WEBHOOK_EVENTS: { value: WebhookEvent; label: string; labelEn: 
   { value: 'account-banned', label: '账号被封禁', labelEn: 'Account banned' },
   { value: 'register-success', label: '注册成功（单账号）', labelEn: 'Register success' },
   { value: 'register-failed', label: '注册失败（单账号）', labelEn: 'Register failed' },
-  { value: 'token-expired', label: 'Token 过期/刷新失败', labelEn: 'Token expired' }
+  { value: 'token-expired', label: 'Token 过期/刷新失败', labelEn: 'Token expired' },
+  { value: 'region-quota-reminder', label: '额度区域待开通', labelEn: 'Open next quota region' }
 ]
 
 export interface WebhookMessage {

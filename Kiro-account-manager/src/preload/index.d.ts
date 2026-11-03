@@ -11,6 +11,7 @@ interface AccountData {
   autoRefreshSyncInfo?: boolean
   batchImportConcurrency?: number
   loginPrivateMode?: boolean
+  regionReminderThreshold?: number
   statusCheckInterval: number
   privacyMode?: boolean
   usagePrecision?: boolean

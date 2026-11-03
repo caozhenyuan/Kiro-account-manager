@@ -356,6 +356,9 @@ interface AccountsState {
   // 登录浏览器隐私模式
   loginPrivateMode: boolean // 登录时使用浏览器隐私/无痕模式
 
+  // 当前额度区域已用达到该值时提醒开通下一个区域；0 = 关闭
+  regionReminderThreshold: number
+
   // 切号目标设置
   switchTarget: 'ide' | 'cli' | 'both' // ide=仅 Kiro IDE, cli=仅 Kiro CLI, both=两者都切
 
@@ -495,6 +498,8 @@ interface AccountsActions {
   // 登录浏览器隐私模式
   setLoginPrivateMode: (enabled: boolean) => void
 
+  setRegionReminderThreshold: (threshold: number) => void
+
   // 切号目标设置
   setSwitchTarget: (target: 'ide' | 'cli' | 'both') => void
 
@@ -631,6 +636,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   autoSwitchInterval: 5,
   batchImportConcurrency: 100,
   loginPrivateMode: false,
+  regionReminderThreshold: 8000,
   switchTarget: 'ide' as const,
   theme: 'default',
   darkMode: false,
@@ -1792,6 +1798,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoRefreshSyncInfo: data.autoRefreshSyncInfo ?? true,
           batchImportConcurrency: data.batchImportConcurrency ?? 100,
           loginPrivateMode: data.loginPrivateMode ?? false,
+          regionReminderThreshold: data.regionReminderThreshold ?? 8000,
           originalMachineId: data.originalMachineId ?? null,
           originalBackupTime: data.originalBackupTime ?? null,
           statusCheckInterval: data.statusCheckInterval ?? 60,
@@ -1913,6 +1920,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       autoRefreshSyncInfo,
       batchImportConcurrency,
       loginPrivateMode,
+      regionReminderThreshold,
       originalMachineId,
       originalBackupTime,
       statusCheckInterval,
@@ -1951,6 +1959,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoRefreshSyncInfo,
           batchImportConcurrency,
           loginPrivateMode,
+          regionReminderThreshold,
           originalMachineId,
           originalBackupTime,
           statusCheckInterval,
@@ -2175,6 +2184,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   setBatchImportConcurrency: (concurrency) => {
     set({ batchImportConcurrency: Math.max(1, Math.min(500, concurrency)) })
+    get().saveToStorage()
+  },
+
+  setRegionReminderThreshold: (threshold) => {
+    set({ regionReminderThreshold: Number.isFinite(threshold) ? Math.max(0, Math.round(threshold)) : 0 })
     get().saveToStorage()
   },
 

@@ -184,6 +184,8 @@ export function SettingsPage() {
     setBatchImportConcurrency,
     loginPrivateMode,
     setLoginPrivateMode,
+    regionReminderThreshold,
+    setRegionReminderThreshold,
     switchTarget,
     setSwitchTarget,
     theme,
@@ -970,6 +972,38 @@ export function SettingsPage() {
           <p className="text-xs text-muted-foreground bg-muted/50 rounded-lg p-2">
             {isEn ? 'Recommended: 10-100. Too high may cause failures, too low is slow.' : '建议范围: 10-100。设置过大可能导致大量「验证失败」，设置过小则导入速度较慢。'}
           </p>
+        </CardContent>
+      </Card>
+
+      {/* 额度区域开通提醒 */}
+      <Card className="hover-lift">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-primary/10">
+              <Globe className="h-4 w-4 text-primary" />
+            </div>
+            {isEn ? 'Quota Region Reminder' : '额度区域开通提醒'}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium">{isEn ? 'Remind when used reaches' : '已用达到时提醒'}</p>
+              <p className="text-sm text-muted-foreground">
+                {isEn
+                  ? 'Desktop notification and webhook when an account\'s current quota region reaches this usage. 0 = off'
+                  : '账号当前额度区域已用达到该值时，发桌面通知和 webhook，提醒开通下一个区域。0 为关闭'}
+              </p>
+            </div>
+            <input
+              type="number"
+              className="w-24 h-9 px-3 rounded-lg border bg-background text-sm text-center focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+              value={regionReminderThreshold}
+              min={0}
+              step={500}
+              onChange={(e) => setRegionReminderThreshold(parseInt(e.target.value) || 0)}
+            />
+          </div>
         </CardContent>
       </Card>
 

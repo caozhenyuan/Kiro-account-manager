@@ -1,13 +1,14 @@
 import { useMemo } from 'react'
 import { useAccountsStore, isBannedAccountError } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle } from '../ui'
-import { Users, CheckCircle, AlertTriangle, Clock, Zap, Shield, Fingerprint, FolderPlus, Tag, TrendingUp, Activity, BarChart3, Ban, ChevronRight } from 'lucide-react'
+import { Users, CheckCircle, AlertTriangle, Clock, Zap, Shield, Fingerprint, FolderPlus, Tag, TrendingUp, Activity, BarChart3, Ban, ChevronRight, Globe } from 'lucide-react'
 import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, AccountFilter } from '@/types/account'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { MonthlyUsageDashboard } from './MonthlyUsageDashboard'
+import { findRegionReminders } from '@/lib/regionReminder'
 
 // 额度告急阈值（usage.percentUsed 为 0-1 小数）
 const QUOTA_WARN_RATIO = 0.9
@@ -28,7 +29,7 @@ const getSubscriptionColor = (type: string, title?: string): string => {
 }
 
 export function HomePage() {
-  const { accounts, activeAccountId, getStats, darkMode, usagePrecision, setFilter, setActiveGroupTab } = useAccountsStore()
+  const { accounts, activeAccountId, getStats, darkMode, usagePrecision, setFilter, setActiveGroupTab, regionReminderThreshold } = useAccountsStore()
   const { t } = useTranslation()
   const stats = getStats()
 
@@ -48,8 +49,9 @@ export function HomePage() {
         quotaHigh.push(a)
       }
     }
-    return { banned, expiring, quotaHigh }
-  }, [accounts])
+    const regionDue = findRegionReminders(accounts.values(), regionReminderThreshold).map((r) => r.account)
+    return { banned, expiring, quotaHigh, regionDue }
+  }, [accounts, regionReminderThreshold])
 
   // 点击告警 → 应用筛选并跳转到账号页（清掉分组 Tab 限制，确保跨组可见）
   const jumpToAccounts = (patch: AccountFilter): void => {
@@ -158,6 +160,16 @@ export function HomePage() {
       label: isEn ? `Quota ≥${Math.round(QUOTA_WARN_RATIO * 100)}%` : `额度告急 (≥${Math.round(QUOTA_WARN_RATIO * 100)}%)`,
       hint: isEn ? 'Almost exhausted' : '即将耗尽',
       onClick: () => jumpToAccounts({ usageMin: QUOTA_WARN_RATIO })
+    },
+    {
+      key: 'region',
+      list: warnings.regionDue,
+      icon: Globe,
+      iconBg: 'bg-sky-500/10',
+      iconColor: 'text-sky-500',
+      label: isEn ? `Region used ≥${regionReminderThreshold}` : `区域已用 ≥${regionReminderThreshold}`,
+      hint: isEn ? 'Open next quota region' : '开通下一个额度区域',
+      onClick: () => jumpToAccounts({})
     }
   ].filter((r) => r.list.length > 0)
 

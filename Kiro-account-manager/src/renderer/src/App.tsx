@@ -4,6 +4,7 @@ import { AccountManager } from './components/accounts'
 import { Sidebar, TitleBar, type PageType } from './components/layout'
 import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, RegisterPage, SubscriptionPage, LogsPage } from './components/pages'
 import { useWebhookStore } from './store/webhooks'
+import { findRegionReminders } from './lib/regionReminder'
 import { UpdateDialog } from './components/UpdateDialog'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { ErrorBoundary } from './components/ErrorBoundary'
@@ -259,6 +260,47 @@ function App(): React.JSX.Element {
 
     try { localStorage.setItem(KEY, JSON.stringify(current)) } catch { /* ignore */ }
   }, [accounts])
+
+  // 当前额度区域已用达到提醒值 → 桌面通知 + webhook，每个账号/区域/计费周期只提醒一次
+  const regionReminderThreshold = useAccountsStore((s) => s.regionReminderThreshold)
+  useEffect(() => {
+    // 账号尚未加载时跳过，否则会把已提醒记录清空、加载后重复提醒
+    if (accounts.size === 0) return
+    const KEY = 'kiro-notified-region-reminders'
+    let notifiedSet: Set<string>
+    try {
+      notifiedSet = new Set<string>(JSON.parse(localStorage.getItem(KEY) || '[]'))
+    } catch {
+      notifiedSet = new Set<string>()
+    }
+
+    const reminders = findRegionReminders(accounts.values(), regionReminderThreshold)
+    const fresh = reminders.filter((r) => !notifiedSet.has(r.key))
+    if (fresh.length > 0) {
+      const lang = useAccountsStore.getState().language
+      const isEn = lang === 'en' || (lang === 'auto' && !navigator.language.startsWith('zh'))
+      const title = isEn ? 'Open the next quota region' : '该开通下一个额度区域了'
+      const lines = fresh.map((r) =>
+        `${r.account.nickname || r.account.email} ${r.region}: ${Math.round(r.used)}`
+      )
+      const body = lines.slice(0, 3).join('\n') + (lines.length > 3 ? (isEn ? `\n+${lines.length - 3} more` : `\n等 ${lines.length} 个`) : '')
+      if (typeof Notification !== 'undefined' && Notification.permission !== 'denied') {
+        const fire = (): void => {
+          try { new Notification(title, { body }) } catch { /* ignore */ }
+        }
+        if (Notification.permission === 'granted') fire()
+        else void Notification.requestPermission().then((p) => { if (p === 'granted') fire() })
+      }
+      void useWebhookStore.getState().triggerEvent('region-quota-reminder', {
+        title,
+        message: lines.join('\n'),
+        level: 'warn',
+        fields: { [isEn ? 'Threshold' : '提醒值']: regionReminderThreshold }
+      })
+    }
+
+    try { localStorage.setItem(KEY, JSON.stringify(reminders.map((r) => r.key))) } catch { /* ignore */ }
+  }, [accounts, regionReminderThreshold])
 
   // 关闭/刷新前强制 flush 防抖中的待保存数据，防止数据丢失
   useEffect(() => {
