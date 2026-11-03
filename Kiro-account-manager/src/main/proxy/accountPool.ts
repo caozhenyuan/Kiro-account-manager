@@ -442,6 +442,46 @@ export class AccountPool {
     }
   }
 
+  // 按额度查询结果校正配额状态：可用 → 清除耗尽标记与断路器计数；不可用 → 与 402 同样标记耗尽并按 quotaResetMs 自动恢复。
+  // 返回状态是否发生变化
+  setQuotaAvailability(accountId: string, available: boolean): boolean {
+    const account = this.accounts.get(accountId)
+    if (!account) return false
+    const now = Date.now()
+    const wasExhausted = this.isQuotaExhausted(account, now)
+    if (available) {
+      if (!wasExhausted) return false
+      this.accounts.set(accountId, {
+        ...account,
+        quotaExhaustedAt: undefined,
+        quotaResetAt: undefined,
+        errorCount: 0
+      })
+      console.log(`[AccountPool] Account ${account.email || accountId} quota available again (usage check)`)
+      return true
+    }
+    if (wasExhausted) return false
+    this.accounts.set(accountId, {
+      ...account,
+      quotaExhaustedAt: now,
+      quotaResetAt: now + this.config.quotaResetMs
+    })
+    console.log(`[AccountPool] Account ${account.email || accountId} quota exhausted (usage check)`)
+    return true
+  }
+
+  // 切换额度区域后旧区域的耗尽标记与失败计数不再适用
+  clearQuotaState(accountId: string): void {
+    const account = this.accounts.get(accountId)
+    if (!account) return
+    this.accounts.set(accountId, {
+      ...account,
+      quotaExhaustedAt: undefined,
+      quotaResetAt: undefined,
+      errorCount: 0
+    })
+  }
+
   // 获取配额状态摘要
   getQuotaStatus(): { total: number; available: number; exhausted: number; cooldown: number } {
     const now = Date.now()

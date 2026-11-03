@@ -28,7 +28,7 @@ import {
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole, getRequestContext } from './proxy/logger'
-import { UsageHistoryStore } from './usageHistory'
+import { UsageHistoryStore, regionHost } from './usageHistory'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -1597,6 +1597,33 @@ function startKiroAuthTokenWatcher(): void {
     }
   })
   console.log('[KiroAuthSync] Watching:', KIRO_AUTH_TOKEN_PATH)
+}
+
+/**
+ * 用额度查询结果校正反代账号池的配额耗尽标记。
+ * 已用 = 基础 + 超额（GetUsageLimits 的 currentUsage 含超额部分），
+ * 所以可用条件是：未用完基础额度，或超额已开启且未到超额上限。
+ * 查询回落到了另一额度区域时数据不代表反代实际请求的区域，不做判断。
+ */
+function syncPoolQuotaFromUsage(
+  accountId: string | undefined,
+  accountApiRegion: string | undefined,
+  usage: {
+    current: number
+    limit: number
+    servedRegion?: string
+    resourceDetail?: { overageEnabled?: boolean; overageCap?: number }
+  } | undefined
+): void {
+  if (!accountId || !usage || !(usage.limit > 0)) return
+  const pool = proxyServer?.getAccountPool()
+  if (!pool?.getAccount(accountId)) return
+  if (usage.servedRegion && regionHost(usage.servedRegion) !== regionHost(accountApiRegion || 'us-east-1')) return
+  const overageEnabled = usage.resourceDetail?.overageEnabled === true
+  const overageCap = usage.resourceDetail?.overageCap
+  const available = usage.current < usage.limit
+    || (overageEnabled && (overageCap === undefined || usage.current < usage.limit + overageCap))
+  pool.setQuotaAvailability(accountId, available)
 }
 
 /**
@@ -3318,6 +3345,7 @@ app.whenReady().then(async () => {
             const newApiRegion = acc.credentials?.apiRegion
             if ((poolAcc.apiRegion || undefined) !== (newApiRegion || undefined)) {
               pool.updateAccount(acc.id, { apiRegion: newApiRegion, profileArn: undefined })
+              pool.clearQuotaState(acc.id)
               console.log(`[ProxyServer] Pool apiRegion synced for ${acc.id}: ${poolAcc.apiRegion || '(none)'} → ${newApiRegion || '(none)'}`)
             }
           }
@@ -3822,6 +3850,13 @@ app.whenReady().then(async () => {
         overageCap: creditUsage.overageCap,
         overageEnabled: result.overageConfiguration?.overageStatus === 'ENABLED' || result.overageConfiguration?.overageEnabled === true
       } : undefined
+
+      syncPoolQuotaFromUsage(account?.id, account?.credentials?.apiRegion || account?.credentials?.region, {
+        current: totalUsed,
+        limit: totalLimit,
+        servedRegion: result.servedRegion,
+        resourceDetail
+      })
 
       return {
         success: true,
@@ -4345,6 +4380,8 @@ app.whenReady().then(async () => {
             success++
             completed++
 
+            syncPoolQuotaFromUsage(account.id, account.credentials?.apiRegion || region, parsedUsage)
+
             if (account.id && !mainWindow) {
               persistRefreshedTokenToSnapshot(account.id, {
                 accessToken: newAccessToken,
@@ -4695,6 +4732,10 @@ app.whenReady().then(async () => {
 
             success++
             completed++
+
+            if (usageData) {
+              syncPoolQuotaFromUsage(account.id, account.credentials?.apiRegion || account.credentials?.region, { ...usageData, resourceDetail })
+            }
 
             // 通知渲染进程更新账号
             mainWindow?.webContents.send('background-check-result', {
